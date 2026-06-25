@@ -1,0 +1,8 @@
+build/
+dist/
+work/
+*.dmg
+*.zip
+.DS_Store
+thinking-shimmer-*.css
+thinking-shimmer-*.js
