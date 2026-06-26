@@ -30,6 +30,8 @@ turn logs, then presents a compact status view:
 - **Thread opening** through `codex://threads/<id>` links when available.
 - **Settings window** for launch behavior, timer visibility, icon style, timer
   count, and shimmer cadence.
+- **Local activity stats** for completed turns, active time, average duration,
+  and longest turn.
 - **File watching plus polling** for responsive updates when Codex state files
   change.
 - **Optional local diagnostics** written to
@@ -115,6 +117,17 @@ Codex Status reads these local files and locations:
 It also checks that recorded process IDs are still alive before treating command
 records as live.
 
+Activity stats are stored locally at:
+
+```text
+~/Library/Application Support/Codex Status/usage-store.json
+```
+
+The app keeps detailed completed-session rows for the most recent 60 days and
+keeps compact daily rollups indefinitely so the `All` filter remains cheap. It
+does not store prompts, responses, file paths, or conversation titles in the
+activity store.
+
 ## Menu and Settings
 
 Click the Codex Status icon to open the app menu:
@@ -136,6 +149,18 @@ Settings are stored in macOS `UserDefaults` for this app:
   conversations collapse into `+N` (1 to 12).
 - **Icon style**: choose Outline, Solid, or Codex artwork.
 - **Shimmer cadence**: choose how frequently the active icon sweep repeats.
+
+The Activity section includes:
+
+- **Turns completed**: completed local Codex turns recorded since this version
+  started tracking.
+- **Active time**: summed active timer duration. Concurrent main/subagent work
+  is summed as Codex work time, not de-overlapped wall-clock time.
+- **Average duration**: active time divided by recorded turns.
+- **Longest turn**: longest recorded completed turn.
+- **Date filters**: `7D`, `30D`, `60D`, and `All`.
+- **Work filters**: `All work`, `Main`, and `Subagents`.
+- **Reset stats**: deletes local Codex Status activity stats.
 
 ## Development
 
@@ -213,6 +238,8 @@ Login Items and confirm Codex Status is allowed.
 - Local-state only; it does not query OpenAI services or remote Codex servers.
 - Status accuracy depends on Codex's current local file formats under
   `~/.codex`.
+- Activity stats start from the version that introduced tracking; there is no
+  historical backfill.
 - Current build scripts produce a native binary for the build machine
   architecture. The DMG generated on Apple Silicon is arm64-only.
 - Public releases should be Developer ID signed and notarized. Local builds are

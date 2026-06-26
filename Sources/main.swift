@@ -32,8 +32,10 @@ struct RolloutSession {
     let path: String
     let threadSource: String?
     let updatedAt: Date
+    let turnId: String?
     let turnStartedAt: Date?
     let turnCompletedAt: Date?
+    let turnCompletionReason: String?
     let isTurnActive: Bool
     let hasTurnState: Bool
 }
@@ -63,6 +65,43 @@ struct ActiveItem {
     let pid: Int?
     let startedAt: Date?
     let completedAt: Date?
+}
+
+struct UsageSession: Codable {
+    let dedupeKey: String
+    let threadId: String
+    let turnId: String?
+    let sourceType: String
+    let startedAt: Date
+    let completedAt: Date
+    let durationSeconds: Int
+    let completionReason: String
+    let observedFirstAt: Date
+    let observedLastAt: Date
+    let appVersion: String
+}
+
+struct DailyUsageRollup: Codable {
+    var date: String
+    var sourceType: String
+    var sessionsCount: Int
+    var totalDurationSeconds: Int
+    var maxDurationSeconds: Int
+}
+
+struct UsageStore: Codable {
+    var trackingStartedAt: Date
+    var recordedKeys: [String]
+    var sessions: [UsageSession]
+    var dailyRollups: [DailyUsageRollup]
+}
+
+struct UsageStats {
+    let turnsCompleted: Int
+    let totalDurationSeconds: Int
+    let averageDurationSeconds: Int
+    let longestDurationSeconds: Int
+    let trackingStartedAt: Date?
 }
 
 struct StatusSnapshot {
@@ -268,6 +307,19 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         case codex
     }
 
+    private enum UsageWindow: String {
+        case sevenDays
+        case thirtyDays
+        case sixtyDays
+        case all
+    }
+
+    private enum UsageSourceFilter: String {
+        case all
+        case main
+        case subagent
+    }
+
     private var maxMenuBarChats: Int {
         get {
             let value = defaults.integer(forKey: "maxMenuBarChats")
@@ -342,6 +394,24 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         defaults.bool(forKey: "debugLogging")
     }
 
+    private var usageWindow: UsageWindow {
+        get {
+            UsageWindow(rawValue: defaults.string(forKey: "usageWindow") ?? "") ?? .thirtyDays
+        }
+        set {
+            defaults.set(newValue.rawValue, forKey: "usageWindow")
+        }
+    }
+
+    private var usageSourceFilter: UsageSourceFilter {
+        get {
+            UsageSourceFilter(rawValue: defaults.string(forKey: "usageSourceFilter") ?? "") ?? .all
+        }
+        set {
+            defaults.set(newValue.rawValue, forKey: "usageSourceFilter")
+        }
+    }
+
     private var activeRolloutStartCache: [String: TimeInterval] {
         get { defaults.dictionary(forKey: "activeRolloutStartCache") as? [String: TimeInterval] ?? [:] }
         set { defaults.set(newValue, forKey: "activeRolloutStartCache") }
@@ -387,6 +457,15 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
 
     private var debugPath: String {
         home.appendingPathComponent(".codex/statusbar/codex-status-debug.json").path
+    }
+
+    private var applicationSupportDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? home.appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("Codex Status", isDirectory: true)
+    }
+
+    private var usageStoreURL: URL {
+        applicationSupportDirectory.appendingPathComponent("usage-store.json")
     }
 
     private var sessionsRoot: URL {
@@ -582,7 +661,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 442),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 650),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -591,7 +670,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         window.center()
         window.isReleasedWhenClosed = false
 
-        let content = NSView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 680, height: 442))
+        let content = NSView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 680, height: 650))
         content.autoresizingMask = [.width, .height]
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor(red: 0.078, green: 0.078, blue: 0.078, alpha: 1).cgColor
@@ -631,6 +710,77 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             detailField.frame = NSRect(x: 24, y: y + 15, width: 400, height: 18)
             group.addSubview(detailField)
         }
+
+        let statsSection = label("Activity", size: 14, weight: .semibold)
+        statsSection.frame = NSRect(x: 44, y: 596, width: 200, height: 20)
+        content.addSubview(statsSection)
+
+        let stats = usageStats(window: usageWindow, source: usageSourceFilter)
+        let statsGroup = makeGroup(NSRect(x: 44, y: 470, width: 592, height: 108))
+        content.addSubview(statsGroup)
+
+        let statTitles = ["Turns completed", "Active time", "Average duration", "Longest turn"]
+        let statValues = [
+            "\(stats.turnsCompleted)",
+            formatDuration(seconds: stats.totalDurationSeconds),
+            stats.turnsCompleted > 0 ? formatDuration(seconds: stats.averageDurationSeconds) : "0s",
+            stats.turnsCompleted > 0 ? formatDuration(seconds: stats.longestDurationSeconds) : "0s"
+        ]
+        let statWidth: CGFloat = statsGroup.bounds.width / 4
+        for index in 0..<4 {
+            if index > 0 {
+                let divider = NSView(frame: NSRect(x: statWidth * CGFloat(index), y: 22, width: 1, height: 64))
+                divider.wantsLayer = true
+                divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
+                statsGroup.addSubview(divider)
+            }
+
+            let value = label(statValues[index], size: 16, weight: .regular)
+            value.alignment = .center
+            value.font = NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .regular)
+            value.frame = NSRect(x: statWidth * CGFloat(index), y: 55, width: statWidth, height: 22)
+            value.tag = 2100 + index
+            statsGroup.addSubview(value)
+
+            let title = label(statTitles[index], size: 12, weight: .regular, color: .secondaryLabelColor)
+            title.alignment = .center
+            title.frame = NSRect(x: statWidth * CGFloat(index), y: 31, width: statWidth, height: 18)
+            statsGroup.addSubview(title)
+        }
+
+        let trackingText = stats.trackingStartedAt.map { "Tracking since \(formatShortDate($0))" } ?? "Stats start from this version onward."
+        let trackingLabel = label(trackingText, size: 12, weight: .regular, color: .secondaryLabelColor)
+        trackingLabel.frame = NSRect(x: 44, y: 440, width: 280, height: 18)
+        trackingLabel.tag = 2110
+        content.addSubview(trackingLabel)
+
+        let windowControl = NSSegmentedControl(labels: ["7D", "30D", "60D", "All"], trackingMode: .selectOne, target: self, action: #selector(changeUsageWindow(_:)))
+        windowControl.frame = NSRect(x: 330, y: 434, width: 136, height: 28)
+        windowControl.segmentStyle = .rounded
+        switch usageWindow {
+        case .sevenDays:
+            windowControl.selectedSegment = 0
+        case .thirtyDays:
+            windowControl.selectedSegment = 1
+        case .sixtyDays:
+            windowControl.selectedSegment = 2
+        case .all:
+            windowControl.selectedSegment = 3
+        }
+        content.addSubview(windowControl)
+
+        let sourceControl = NSSegmentedControl(labels: ["All work", "Main", "Subagents"], trackingMode: .selectOne, target: self, action: #selector(changeUsageSource(_:)))
+        sourceControl.frame = NSRect(x: 476, y: 434, width: 160, height: 28)
+        sourceControl.segmentStyle = .rounded
+        switch usageSourceFilter {
+        case .all:
+            sourceControl.selectedSegment = 0
+        case .main:
+            sourceControl.selectedSegment = 1
+        case .subagent:
+            sourceControl.selectedSegment = 2
+        }
+        content.addSubview(sourceControl)
 
         let menuSection = label("Menu bar", size: 14, weight: .semibold)
         menuSection.frame = NSRect(x: 44, y: 388, width: 200, height: 20)
@@ -702,6 +852,11 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         shimmerControl.selectedSegment = frames <= 48 ? 0 : frames <= 96 ? 1 : 2
         menuGroup.addSubview(shimmerControl)
 
+        let resetButton = NSButton(title: "Reset stats", target: self, action: #selector(resetUsageStatsFromSettings))
+        resetButton.bezelStyle = .rounded
+        resetButton.frame = NSRect(x: 536, y: 386, width: 100, height: 28)
+        content.addSubview(resetButton)
+
         window.contentView = content
         settingsWindow = window
         window.makeKeyAndOrderFront(nil)
@@ -728,6 +883,56 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
 
     @objc private func changeShowTimerStrip(_ sender: NSSwitch) {
         showTimerStrip = sender.state == .on
+    }
+
+    @objc private func changeUsageWindow(_ sender: NSSegmentedControl) {
+        switch sender.selectedSegment {
+        case 0:
+            usageWindow = .sevenDays
+        case 2:
+            usageWindow = .sixtyDays
+        case 3:
+            usageWindow = .all
+        default:
+            usageWindow = .thirtyDays
+        }
+        updateSettingsUsageStats()
+    }
+
+    @objc private func changeUsageSource(_ sender: NSSegmentedControl) {
+        switch sender.selectedSegment {
+        case 1:
+            usageSourceFilter = .main
+        case 2:
+            usageSourceFilter = .subagent
+        default:
+            usageSourceFilter = .all
+        }
+        updateSettingsUsageStats()
+    }
+
+    @objc private func resetUsageStatsFromSettings() {
+        resetUsageStats()
+        updateSettingsUsageStats()
+    }
+
+    private func updateSettingsUsageStats() {
+        guard let content = settingsWindow?.contentView else { return }
+        let stats = usageStats(window: usageWindow, source: usageSourceFilter)
+        let values = [
+            "\(stats.turnsCompleted)",
+            formatDuration(seconds: stats.totalDurationSeconds),
+            stats.turnsCompleted > 0 ? formatDuration(seconds: stats.averageDurationSeconds) : "0s",
+            stats.turnsCompleted > 0 ? formatDuration(seconds: stats.longestDurationSeconds) : "0s"
+        ]
+        for index in 0..<values.count {
+            if let field = content.viewWithTag(2100 + index) as? NSTextField {
+                field.stringValue = values[index]
+            }
+        }
+        if let trackingLabel = content.viewWithTag(2110) as? NSTextField {
+            trackingLabel.stringValue = stats.trackingStartedAt.map { "Tracking since \(formatShortDate($0))" } ?? "Stats start from this version onward."
+        }
     }
 
     @objc private func changeLaunchAtLogin(_ sender: NSSwitch) {
@@ -808,6 +1013,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                 self.snapshot = nextSnapshot
                 self.refreshInFlight = false
                 self.render()
+                self.updateSettingsUsageStats()
                 if self.pendingRefresh {
                     self.refreshSoon()
                 }
@@ -824,12 +1030,175 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         lastCompletedIds = completedIds
     }
 
+    private func recordUsage(for rollouts: [RolloutSession], now: Date) {
+        let completed = rollouts.filter { rollout in
+            guard let startedAt = rollout.turnStartedAt,
+                  let completedAt = rollout.turnCompletedAt else { return false }
+            return completedAt >= startedAt && completedAt.timeIntervalSince(startedAt) >= 5
+        }
+        guard !completed.isEmpty else { return }
+
+        var store = readUsageStore(now: now)
+        var keys = Set(store.recordedKeys)
+        var changed = false
+        for rollout in completed {
+            guard let startedAt = rollout.turnStartedAt,
+                  let completedAt = rollout.turnCompletedAt else { continue }
+            guard completedAt >= store.trackingStartedAt else { continue }
+            let duration = max(0, Int(completedAt.timeIntervalSince(startedAt)))
+            let key = usageDedupeKey(for: rollout, startedAt: startedAt, completedAt: completedAt, duration: duration)
+            guard !keys.contains(key) else { continue }
+            keys.insert(key)
+            let sourceType = normalizedSourceType(rollout.threadSource)
+            let session = UsageSession(
+                dedupeKey: key,
+                threadId: rollout.id,
+                turnId: rollout.turnId,
+                sourceType: sourceType,
+                startedAt: startedAt,
+                completedAt: completedAt,
+                durationSeconds: duration,
+                completionReason: rollout.turnCompletionReason ?? "unknown",
+                observedFirstAt: now,
+                observedLastAt: now,
+                appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+            )
+            store.sessions.append(session)
+            upsertDailyRollup(for: session, in: &store)
+            changed = true
+        }
+
+        guard changed else { return }
+        store.recordedKeys = Array(keys)
+        compactUsageStore(&store, now: now)
+        writeUsageStore(store)
+    }
+
+    private func usageDedupeKey(for rollout: RolloutSession, startedAt: Date, completedAt: Date, duration: Int) -> String {
+        if let turnId = rollout.turnId {
+            return "\(rollout.id)#\(turnId)"
+        }
+        return "\(rollout.id)#\(Int(startedAt.timeIntervalSince1970))#\(Int(completedAt.timeIntervalSince1970))#\(duration)"
+    }
+
+    private func normalizedSourceType(_ raw: String?) -> String {
+        raw == "subagent" ? "subagent" : "main"
+    }
+
+    private func upsertDailyRollup(for session: UsageSession, in store: inout UsageStore) {
+        let key = dayKey(for: session.completedAt)
+        if let index = store.dailyRollups.firstIndex(where: { $0.date == key && $0.sourceType == session.sourceType }) {
+            store.dailyRollups[index].sessionsCount += 1
+            store.dailyRollups[index].totalDurationSeconds += session.durationSeconds
+            store.dailyRollups[index].maxDurationSeconds = max(store.dailyRollups[index].maxDurationSeconds, session.durationSeconds)
+        } else {
+            store.dailyRollups.append(DailyUsageRollup(
+                date: key,
+                sourceType: session.sourceType,
+                sessionsCount: 1,
+                totalDurationSeconds: session.durationSeconds,
+                maxDurationSeconds: session.durationSeconds
+            ))
+        }
+    }
+
+    private func readUsageStore(now: Date = Date()) -> UsageStore {
+        guard let data = try? Data(contentsOf: usageStoreURL),
+              let store = try? JSONDecoder().decode(UsageStore.self, from: data) else {
+            return UsageStore(trackingStartedAt: now, recordedKeys: [], sessions: [], dailyRollups: [])
+        }
+        return store
+    }
+
+    private func writeUsageStore(_ store: UsageStore) {
+        do {
+            try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(store)
+            try data.write(to: usageStoreURL, options: [.atomic])
+        } catch {
+            NSLog("Codex Status usage store write failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func compactUsageStore(_ store: inout UsageStore, now: Date) {
+        let cutoff = now.addingTimeInterval(-60 * 24 * 60 * 60)
+        store.sessions = store.sessions.filter { $0.completedAt >= cutoff }
+        let recentKeys = Set(store.sessions.map(\.dedupeKey))
+        store.recordedKeys = store.recordedKeys.filter { recentKeys.contains($0) }
+        store.dailyRollups.sort {
+            if $0.date == $1.date { return $0.sourceType < $1.sourceType }
+            return $0.date < $1.date
+        }
+    }
+
+    private func resetUsageStats() {
+        try? FileManager.default.removeItem(at: usageStoreURL)
+    }
+
+    private func usageStats(window: UsageWindow, source: UsageSourceFilter, now: Date = Date()) -> UsageStats {
+        var store = readUsageStore(now: now)
+        compactUsageStore(&store, now: now)
+        let rows = store.dailyRollups.filter { rollup in
+            usageSourceMatches(rollup.sourceType, filter: source) && usageDateMatches(rollup.date, window: window, now: now)
+        }
+        let count = rows.reduce(0) { $0 + $1.sessionsCount }
+        let total = rows.reduce(0) { $0 + $1.totalDurationSeconds }
+        let longest = rows.map(\.maxDurationSeconds).max() ?? 0
+        return UsageStats(
+            turnsCompleted: count,
+            totalDurationSeconds: total,
+            averageDurationSeconds: count > 0 ? total / count : 0,
+            longestDurationSeconds: longest,
+            trackingStartedAt: store.dailyRollups.isEmpty && store.sessions.isEmpty ? nil : store.trackingStartedAt
+        )
+    }
+
+    private func usageSourceMatches(_ sourceType: String, filter: UsageSourceFilter) -> Bool {
+        switch filter {
+        case .all:
+            return true
+        case .main:
+            return sourceType == "main"
+        case .subagent:
+            return sourceType == "subagent"
+        }
+    }
+
+    private func usageDateMatches(_ day: String, window: UsageWindow, now: Date) -> Bool {
+        guard window != .all else { return true }
+        let days: Int
+        switch window {
+        case .sevenDays:
+            days = 7
+        case .thirtyDays:
+            days = 30
+        case .sixtyDays:
+            days = 60
+        case .all:
+            days = 0
+        }
+        let cutoff = Calendar.current.startOfDay(for: now.addingTimeInterval(TimeInterval(-(days - 1) * 24 * 60 * 60)))
+        return day >= dayKey(for: cutoff)
+    }
+
+    private func dayKey(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
     private func buildSnapshot() -> StatusSnapshot {
         let now = Date()
         let codexRunning = cachedIsCodexRunning(now: now)
         let sessions = readRecentSessions(limit: 60)
         let sessionTitles = readSessionTitleIndex()
         let rolloutSessions = readRecentRolloutSessions(titleIndex: sessionTitles)
+        recordUsage(for: rolloutSessions, now: now)
         let liveCommands = readChatProcesses().filter { command in
             guard let pid = command.osPid, isProcessAlive(pid: pid) else { return false }
             return now.timeIntervalSince(Date(timeIntervalSince1970: command.startedAtMs / 1000)) < staleCommandWindow
@@ -1226,8 +1595,10 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             path: entry.rolloutPath,
             threadSource: entry.threadSource,
             updatedAt: Date(timeIntervalSince1970: entry.touchedAtMs / 1000),
+            turnId: turnState.turnId,
             turnStartedAt: turnState.startedAt,
             turnCompletedAt: turnState.completedAt,
+            turnCompletionReason: turnState.completionReason,
             isTurnActive: turnState.isActive,
             hasTurnState: turnState.hasState
         )
@@ -1253,8 +1624,10 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             path: url.path,
             threadSource: payload["thread_source"] as? String,
             updatedAt: updatedAt,
+            turnId: turnState.turnId,
             turnStartedAt: turnState.startedAt,
             turnCompletedAt: turnState.completedAt,
+            turnCompletionReason: turnState.completionReason,
             isTurnActive: turnState.isActive,
             hasTurnState: turnState.hasState
         )
@@ -1278,8 +1651,8 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             }
     }
 
-    private func readRolloutTurnState(at url: URL) -> (startedAt: Date?, completedAt: Date?, isActive: Bool, hasState: Bool) {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return (nil, nil, false, false) }
+    private func readRolloutTurnState(at url: URL) -> (turnId: String?, startedAt: Date?, completedAt: Date?, completionReason: String?, isActive: Bool, hasState: Bool) {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return (nil, nil, nil, nil, false, false) }
         defer { try? handle.close() }
 
         let size = (try? handle.seekToEnd()) ?? 0
@@ -1287,7 +1660,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         try? handle.seek(toOffset: size > chunk ? size - chunk : 0)
 
         guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return (nil, nil, false, false) }
+              let text = String(data: data, encoding: .utf8) else { return (nil, nil, nil, nil, false, false) }
 
         var lastTurnId: String?
         var openTurnStartedAt: Date?
@@ -1297,6 +1670,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         var firstSeenByTurnId: [String: Date] = [:]
         var terminalAnswerTurnIds = Set<String>()
         var abortedTurnIds = Set<String>()
+        var completionReasonByTurnId: [String: String] = [:]
         var sawCompaction = false
 
         for line in text.split(separator: "\n") {
@@ -1331,6 +1705,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                       payload["type"] as? String == "task_complete",
                       let turnId = payload["turn_id"] as? String {
                 completedTurnIds.insert(turnId)
+                completionReasonByTurnId[turnId] = "completed"
                 if let completedAt = completedAt(from: payload, fallback: timestamp) {
                     lastCompletedStartedAt = openTurnStartedAt ?? firstSeenByTurnId[turnId]
                     lastCompletedAt = completedAt
@@ -1342,6 +1717,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                       let payload = obj["payload"] as? [String: Any],
                       let turnId = abortedTurnId(from: payload, fallback: lastTurnId) {
                 abortedTurnIds.insert(turnId)
+                completionReasonByTurnId[turnId] = "stopped"
                 lastCompletedStartedAt = openTurnStartedAt ?? firstSeenByTurnId[turnId]
                 lastCompletedAt = timestamp
                 if turnId == lastTurnId {
@@ -1363,6 +1739,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                    payload["role"] as? String == "assistant",
                    payload["phase"] as? String == "final_answer" {
                     terminalAnswerTurnIds.insert(turnId)
+                    completionReasonByTurnId[turnId] = completionReasonByTurnId[turnId] ?? "completed"
                     lastCompletedStartedAt = openTurnStartedAt ?? firstSeenByTurnId[turnId]
                     lastCompletedAt = timestamp
                     openTurnStartedAt = nil
@@ -1370,7 +1747,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             }
         }
 
-        guard let turnId = lastTurnId else { return (nil, nil, false, false) }
+        guard let turnId = lastTurnId else { return (nil, nil, nil, nil, false, false) }
         let isComplete = completedTurnIds.contains(turnId)
             || terminalAnswerTurnIds.contains(turnId)
             || abortedTurnIds.contains(turnId)
@@ -1381,7 +1758,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                let fullStart = readTaskStartedAt(in: url, turnId: turnId) {
                 startedAt = min(startedAt ?? fullStart, fullStart)
             }
-            return (startedAt, lastCompletedAt, false, true)
+            return (turnId, startedAt, lastCompletedAt, completionReasonByTurnId[turnId] ?? "unknown", false, true)
         }
         var startedAt = openTurnStartedAt ?? firstSeenByTurnId[turnId]
         if startedAt == nil,
@@ -1389,7 +1766,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
            let fullStart = readTaskStartedAt(in: url, turnId: turnId) {
             startedAt = min(startedAt ?? fullStart, fullStart)
         }
-        return (startedAt, nil, true, true)
+        return (turnId, startedAt, nil, nil, true, true)
     }
 
     private func readTaskStartedAt(in url: URL, turnId: String) -> Date? {
@@ -1651,6 +2028,14 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             return "\(minutes)m \(secs)s"
         }
         return "\(secs)s"
+    }
+
+    private func formatShortDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.timeZone = .current
+        formatter.setLocalizedDateFormatFromTemplate("MMM d, y")
+        return formatter.string(from: date)
     }
 
     private func relativeTime(_ date: Date) -> String {
