@@ -475,6 +475,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     override init() {
         super.init()
         NSApp.setActivationPolicy(.accessory)
+        ensureUsageStoreExists()
 
         statusMenu.delegate = self
         if let button = statusItem.button {
@@ -711,12 +712,42 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             group.addSubview(detailField)
         }
 
+        func filterButton(_ title: String, tag: Int, frame: NSRect, action: Selector) -> NSButton {
+            let button = NSButton(title: title, target: self, action: action)
+            button.frame = frame
+            button.tag = tag
+            button.isBordered = false
+            button.bezelStyle = .regularSquare
+            button.alignment = .center
+            button.setButtonType(.momentaryChange)
+            return button
+        }
+
         let statsSection = label("Activity", size: 14, weight: .semibold)
         statsSection.frame = NSRect(x: 44, y: 596, width: 200, height: 20)
         content.addSubview(statsSection)
 
+        let dateFilters = [
+            ("7D", 2200, NSRect(x: 44, y: 574, width: 28, height: 22)),
+            ("30D", 2201, NSRect(x: 80, y: 574, width: 38, height: 22)),
+            ("60D", 2202, NSRect(x: 126, y: 574, width: 38, height: 22)),
+            ("All", 2203, NSRect(x: 172, y: 574, width: 30, height: 22))
+        ]
+        dateFilters.forEach { title, tag, frame in
+            content.addSubview(filterButton(title, tag: tag, frame: frame, action: #selector(changeUsageWindow(_:))))
+        }
+
+        let sourceFilters = [
+            ("All work", 2210, NSRect(x: 410, y: 574, width: 70, height: 22)),
+            ("Main", 2211, NSRect(x: 488, y: 574, width: 48, height: 22)),
+            ("Subagents", 2212, NSRect(x: 544, y: 574, width: 92, height: 22))
+        ]
+        sourceFilters.forEach { title, tag, frame in
+            content.addSubview(filterButton(title, tag: tag, frame: frame, action: #selector(changeUsageSource(_:))))
+        }
+
         let stats = usageStats(window: usageWindow, source: usageSourceFilter)
-        let statsGroup = makeGroup(NSRect(x: 44, y: 470, width: 592, height: 108))
+        let statsGroup = makeGroup(NSRect(x: 44, y: 470, width: 592, height: 88))
         content.addSubview(statsGroup)
 
         let statTitles = ["Turns completed", "Active time", "Average duration", "Longest turn"]
@@ -729,7 +760,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         let statWidth: CGFloat = statsGroup.bounds.width / 4
         for index in 0..<4 {
             if index > 0 {
-                let divider = NSView(frame: NSRect(x: statWidth * CGFloat(index), y: 22, width: 1, height: 64))
+                let divider = NSView(frame: NSRect(x: statWidth * CGFloat(index), y: 20, width: 1, height: 48))
                 divider.wantsLayer = true
                 divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
                 statsGroup.addSubview(divider)
@@ -738,49 +769,16 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             let value = label(statValues[index], size: 16, weight: .regular)
             value.alignment = .center
             value.font = NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .regular)
-            value.frame = NSRect(x: statWidth * CGFloat(index), y: 55, width: statWidth, height: 22)
+            value.frame = NSRect(x: statWidth * CGFloat(index), y: 47, width: statWidth, height: 22)
             value.tag = 2100 + index
             statsGroup.addSubview(value)
 
             let title = label(statTitles[index], size: 12, weight: .regular, color: .secondaryLabelColor)
             title.alignment = .center
-            title.frame = NSRect(x: statWidth * CGFloat(index), y: 31, width: statWidth, height: 18)
+            title.frame = NSRect(x: statWidth * CGFloat(index), y: 23, width: statWidth, height: 18)
             statsGroup.addSubview(title)
         }
-
-        let trackingText = stats.trackingStartedAt.map { "Tracking since \(formatShortDate($0))" } ?? "Stats start from this version onward."
-        let trackingLabel = label(trackingText, size: 12, weight: .regular, color: .secondaryLabelColor)
-        trackingLabel.frame = NSRect(x: 44, y: 440, width: 280, height: 18)
-        trackingLabel.tag = 2110
-        content.addSubview(trackingLabel)
-
-        let windowControl = NSSegmentedControl(labels: ["7D", "30D", "60D", "All"], trackingMode: .selectOne, target: self, action: #selector(changeUsageWindow(_:)))
-        windowControl.frame = NSRect(x: 330, y: 434, width: 136, height: 28)
-        windowControl.segmentStyle = .rounded
-        switch usageWindow {
-        case .sevenDays:
-            windowControl.selectedSegment = 0
-        case .thirtyDays:
-            windowControl.selectedSegment = 1
-        case .sixtyDays:
-            windowControl.selectedSegment = 2
-        case .all:
-            windowControl.selectedSegment = 3
-        }
-        content.addSubview(windowControl)
-
-        let sourceControl = NSSegmentedControl(labels: ["All work", "Main", "Subagents"], trackingMode: .selectOne, target: self, action: #selector(changeUsageSource(_:)))
-        sourceControl.frame = NSRect(x: 476, y: 434, width: 160, height: 28)
-        sourceControl.segmentStyle = .rounded
-        switch usageSourceFilter {
-        case .all:
-            sourceControl.selectedSegment = 0
-        case .main:
-            sourceControl.selectedSegment = 1
-        case .subagent:
-            sourceControl.selectedSegment = 2
-        }
-        content.addSubview(sourceControl)
+        updateSettingsFilterStyles(in: content)
 
         let menuSection = label("Menu bar", size: 14, weight: .semibold)
         menuSection.frame = NSRect(x: 44, y: 388, width: 200, height: 20)
@@ -885,13 +883,13 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         showTimerStrip = sender.state == .on
     }
 
-    @objc private func changeUsageWindow(_ sender: NSSegmentedControl) {
-        switch sender.selectedSegment {
-        case 0:
+    @objc private func changeUsageWindow(_ sender: NSButton) {
+        switch sender.tag {
+        case 2200:
             usageWindow = .sevenDays
-        case 2:
+        case 2202:
             usageWindow = .sixtyDays
-        case 3:
+        case 2203:
             usageWindow = .all
         default:
             usageWindow = .thirtyDays
@@ -899,11 +897,11 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         updateSettingsUsageStats()
     }
 
-    @objc private func changeUsageSource(_ sender: NSSegmentedControl) {
-        switch sender.selectedSegment {
-        case 1:
+    @objc private func changeUsageSource(_ sender: NSButton) {
+        switch sender.tag {
+        case 2211:
             usageSourceFilter = .main
-        case 2:
+        case 2212:
             usageSourceFilter = .subagent
         default:
             usageSourceFilter = .all
@@ -930,8 +928,44 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                 field.stringValue = values[index]
             }
         }
-        if let trackingLabel = content.viewWithTag(2110) as? NSTextField {
-            trackingLabel.stringValue = stats.trackingStartedAt.map { "Tracking since \(formatShortDate($0))" } ?? "Stats start from this version onward."
+        updateSettingsFilterStyles(in: content)
+    }
+
+    private func updateSettingsFilterStyles(in content: NSView) {
+        let selectedWindowTag: Int
+        switch usageWindow {
+        case .sevenDays:
+            selectedWindowTag = 2200
+        case .thirtyDays:
+            selectedWindowTag = 2201
+        case .sixtyDays:
+            selectedWindowTag = 2202
+        case .all:
+            selectedWindowTag = 2203
+        }
+
+        let selectedSourceTag: Int
+        switch usageSourceFilter {
+        case .all:
+            selectedSourceTag = 2210
+        case .main:
+            selectedSourceTag = 2211
+        case .subagent:
+            selectedSourceTag = 2212
+        }
+
+        for tag in [2200, 2201, 2202, 2203, 2210, 2211, 2212] {
+            guard let button = content.viewWithTag(tag) as? NSButton else { continue }
+            let selected = tag == selectedWindowTag || tag == selectedSourceTag
+            let color: NSColor = selected ? .labelColor : .secondaryLabelColor
+            let weight: NSFont.Weight = selected ? .semibold : .regular
+            button.attributedTitle = NSAttributedString(
+                string: button.title,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 13, weight: weight),
+                    .foregroundColor: color
+                ]
+            )
         }
     }
 
@@ -1110,6 +1144,11 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         return store
     }
 
+    private func ensureUsageStoreExists() {
+        guard !FileManager.default.fileExists(atPath: usageStoreURL.path) else { return }
+        writeUsageStore(UsageStore(trackingStartedAt: Date(), recordedKeys: [], sessions: [], dailyRollups: []))
+    }
+
     private func writeUsageStore(_ store: UsageStore) {
         do {
             try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
@@ -1135,6 +1174,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
 
     private func resetUsageStats() {
         try? FileManager.default.removeItem(at: usageStoreURL)
+        ensureUsageStoreExists()
     }
 
     private func usageStats(window: UsageWindow, source: UsageSourceFilter, now: Date = Date()) -> UsageStats {
