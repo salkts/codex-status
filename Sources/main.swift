@@ -521,7 +521,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             }
 
             let entry = NSMenuItem(
-                title: "\(item.title)\(elapsed)",
+                title: "\(truncatedConversationTitle(item.title))\(elapsed)",
                 action: #selector(openConversationFromMenu(_:)),
                 keyEquivalent: ""
             )
@@ -1618,6 +1618,16 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             return URL(fileURLWithPath: cwd).lastPathComponent
         }
         return command.conversationId
+    }
+
+    private func truncatedConversationTitle(_ title: String, limit: Int = 50) -> String {
+        let normalized = title
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count > limit else { return normalized }
+        let end = normalized.index(normalized.startIndex, offsetBy: max(0, limit - 3))
+        return "\(normalized[..<end])..."
     }
 
     private func formatElapsed(since date: Date) -> String {
