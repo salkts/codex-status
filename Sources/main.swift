@@ -724,33 +724,33 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         }
 
         let statsSection = label("Activity", size: 14, weight: .semibold)
-        statsSection.frame = NSRect(x: 44, y: 596, width: 200, height: 20)
+        statsSection.frame = NSRect(x: 44, y: 604, width: 200, height: 20)
         content.addSubview(statsSection)
 
         let dateFilters = [
-            ("7D", 2200, NSRect(x: 44, y: 574, width: 28, height: 22)),
-            ("30D", 2201, NSRect(x: 80, y: 574, width: 38, height: 22)),
-            ("60D", 2202, NSRect(x: 126, y: 574, width: 38, height: 22)),
-            ("All", 2203, NSRect(x: 172, y: 574, width: 30, height: 22))
+            ("7D", 2200, NSRect(x: 478, y: 480, width: 28, height: 22)),
+            ("30D", 2201, NSRect(x: 514, y: 480, width: 38, height: 22)),
+            ("60D", 2202, NSRect(x: 560, y: 480, width: 38, height: 22)),
+            ("All", 2203, NSRect(x: 606, y: 480, width: 30, height: 22))
         ]
         dateFilters.forEach { title, tag, frame in
             content.addSubview(filterButton(title, tag: tag, frame: frame, action: #selector(changeUsageWindow(_:))))
         }
 
         let sourceFilters = [
-            ("All work", 2210, NSRect(x: 410, y: 574, width: 70, height: 22)),
-            ("Main", 2211, NSRect(x: 488, y: 574, width: 48, height: 22)),
-            ("Subagents", 2212, NSRect(x: 544, y: 574, width: 92, height: 22))
+            ("All work", 2210, NSRect(x: 32, y: 480, width: 92, height: 22)),
+            ("Main", 2211, NSRect(x: 122, y: 480, width: 58, height: 22)),
+            ("Subagents", 2212, NSRect(x: 178, y: 480, width: 104, height: 22))
         ]
         sourceFilters.forEach { title, tag, frame in
             content.addSubview(filterButton(title, tag: tag, frame: frame, action: #selector(changeUsageSource(_:))))
         }
 
         let stats = usageStats(window: usageWindow, source: usageSourceFilter)
-        let statsGroup = makeGroup(NSRect(x: 44, y: 470, width: 592, height: 88))
+        let statsGroup = makeGroup(NSRect(x: 44, y: 510, width: 592, height: 72))
         content.addSubview(statsGroup)
 
-        let statTitles = ["Turns completed", "Active time", "Average duration", "Longest turn"]
+        let statTitles = ["Turns completed", "Total active time", "Average duration", "Longest turn"]
         let statValues = [
             "\(stats.turnsCompleted)",
             formatDuration(seconds: stats.totalDurationSeconds),
@@ -760,7 +760,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         let statWidth: CGFloat = statsGroup.bounds.width / 4
         for index in 0..<4 {
             if index > 0 {
-                let divider = NSView(frame: NSRect(x: statWidth * CGFloat(index), y: 20, width: 1, height: 48))
+                let divider = NSView(frame: NSRect(x: statWidth * CGFloat(index), y: 15, width: 1, height: 36))
                 divider.wantsLayer = true
                 divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
                 statsGroup.addSubview(divider)
@@ -769,22 +769,22 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             let value = label(statValues[index], size: 16, weight: .regular)
             value.alignment = .center
             value.font = NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .regular)
-            value.frame = NSRect(x: statWidth * CGFloat(index), y: 47, width: statWidth, height: 22)
+            value.frame = NSRect(x: statWidth * CGFloat(index), y: 35, width: statWidth, height: 22)
             value.tag = 2100 + index
             statsGroup.addSubview(value)
 
             let title = label(statTitles[index], size: 12, weight: .regular, color: .secondaryLabelColor)
             title.alignment = .center
-            title.frame = NSRect(x: statWidth * CGFloat(index), y: 23, width: statWidth, height: 18)
+            title.frame = NSRect(x: statWidth * CGFloat(index), y: 14, width: statWidth, height: 18)
             statsGroup.addSubview(title)
         }
         updateSettingsFilterStyles(in: content)
 
         let menuSection = label("Menu bar", size: 14, weight: .semibold)
-        menuSection.frame = NSRect(x: 44, y: 388, width: 200, height: 20)
+        menuSection.frame = NSRect(x: 44, y: 430, width: 200, height: 20)
         content.addSubview(menuSection)
 
-        let menuGroup = makeGroup(NSRect(x: 44, y: 28, width: 592, height: 350))
+        let menuGroup = makeGroup(NSRect(x: 44, y: 58, width: 592, height: 350))
         content.addSubview(menuGroup)
         addSeparator(to: menuGroup, y: 280)
         addSeparator(to: menuGroup, y: 210)
@@ -850,11 +850,6 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         shimmerControl.selectedSegment = frames <= 48 ? 0 : frames <= 96 ? 1 : 2
         menuGroup.addSubview(shimmerControl)
 
-        let resetButton = NSButton(title: "Reset stats", target: self, action: #selector(resetUsageStatsFromSettings))
-        resetButton.bezelStyle = .rounded
-        resetButton.frame = NSRect(x: 536, y: 386, width: 100, height: 28)
-        content.addSubview(resetButton)
-
         window.contentView = content
         settingsWindow = window
         window.makeKeyAndOrderFront(nil)
@@ -906,11 +901,6 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         default:
             usageSourceFilter = .all
         }
-        updateSettingsUsageStats()
-    }
-
-    @objc private func resetUsageStatsFromSettings() {
-        resetUsageStats()
         updateSettingsUsageStats()
     }
 
@@ -1170,11 +1160,6 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             if $0.date == $1.date { return $0.sourceType < $1.sourceType }
             return $0.date < $1.date
         }
-    }
-
-    private func resetUsageStats() {
-        try? FileManager.default.removeItem(at: usageStoreURL)
-        ensureUsageStoreExists()
     }
 
     private func usageStats(window: UsageWindow, source: UsageSourceFilter, now: Date = Date()) -> UsageStats {
