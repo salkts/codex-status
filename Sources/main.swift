@@ -670,16 +670,21 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         window.title = "Settings"
         window.center()
         window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: .darkAqua)
 
         let content = NSView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 680, height: 650))
         content.autoresizingMask = [.width, .height]
+        content.appearance = NSAppearance(named: .darkAqua)
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor(red: 0.078, green: 0.078, blue: 0.078, alpha: 1).cgColor
 
-        func label(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor = .labelColor) -> NSTextField {
+        let primaryTextColor = NSColor(calibratedWhite: 0.88, alpha: 1)
+        let secondaryTextColor = NSColor(calibratedWhite: 0.62, alpha: 1)
+
+        func label(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor? = nil) -> NSTextField {
             let field = NSTextField(labelWithString: text)
             field.font = NSFont.systemFont(ofSize: size, weight: weight)
-            field.textColor = color
+            field.textColor = color ?? primaryTextColor
             field.lineBreakMode = .byTruncatingTail
             return field
         }
@@ -707,7 +712,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             titleField.frame = NSRect(x: 24, y: y + 37, width: 340, height: 18)
             group.addSubview(titleField)
 
-            let detailField = label(detail, size: 12, weight: .regular, color: .secondaryLabelColor)
+            let detailField = label(detail, size: 12, weight: .regular, color: secondaryTextColor)
             detailField.frame = NSRect(x: 24, y: y + 15, width: 400, height: 18)
             group.addSubview(detailField)
         }
@@ -773,7 +778,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             value.tag = 2100 + index
             statsGroup.addSubview(value)
 
-            let title = label(statTitles[index], size: 12, weight: .regular, color: .secondaryLabelColor)
+            let title = label(statTitles[index], size: 12, weight: .regular, color: secondaryTextColor)
             title.alignment = .center
             title.frame = NSRect(x: statWidth * CGFloat(index), y: 14, width: statWidth, height: 18)
             statsGroup.addSubview(title)
@@ -947,7 +952,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         for tag in [2200, 2201, 2202, 2203, 2210, 2211, 2212] {
             guard let button = content.viewWithTag(tag) as? NSButton else { continue }
             let selected = tag == selectedWindowTag || tag == selectedSourceTag
-            let color: NSColor = selected ? .labelColor : .secondaryLabelColor
+            let color = NSColor(calibratedWhite: selected ? 0.88 : 0.62, alpha: 1)
             let weight: NSFont.Weight = selected ? .semibold : .regular
             button.attributedTitle = NSAttributedString(
                 string: button.title,
