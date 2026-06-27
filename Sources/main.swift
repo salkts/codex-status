@@ -134,15 +134,20 @@ final class StatusBarContentView: NSView {
     struct Segment {
         let title: String
         let item: ActiveItem?
+        let completed: Bool
+        let opensCodex: Bool
+        let opensMenu: Bool
     }
 
     var icon: NSImage?
     var segments: [Segment] = []
     var font = NSFont.menuBarFont(ofSize: 12)
     var onSegmentClick: ((ActiveItem) -> Void)?
+    var onOpenCodexClick: (() -> Void)?
     var onMenuClick: (() -> Void)?
+    var onConversationMenuClick: (() -> Void)?
 
-    private var hitRects: [(rect: NSRect, item: ActiveItem)] = []
+    private var hitRects: [(rect: NSRect, segment: Segment)] = []
     private let iconSize = NSSize(width: 18, height: 18)
     private let horizontalPadding: CGFloat = 5
     private let iconTextGap: CGFloat = 4
@@ -164,24 +169,26 @@ final class StatusBarContentView: NSView {
 
     func updateIcon(_ icon: NSImage?) {
         self.icon = icon
-        needsDisplay = true
+        setNeedsDisplay(iconDrawRect().insetBy(dx: -1, dy: -1))
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        hitRects.removeAll()
 
         var x = horizontalPadding
         if let icon {
-            let y = (bounds.height - iconSize.height) / 2
-            icon.draw(in: NSRect(x: x, y: y, width: iconSize.width, height: iconSize.height))
+            icon.draw(in: iconDrawRect())
         }
-        x += iconSize.width + iconTextGap
+        x += iconSize.width
+        if !dirtyRect.intersects(textDrawBounds()) && !hitRects.isEmpty {
+            return
+        }
 
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.labelColor
-        ]
+        hitRects.removeAll()
+
+        if !segments.isEmpty {
+            x += iconTextGap
+        }
 
         for (index, segment) in segments.enumerated() {
             if index > 0 {
@@ -196,6 +203,10 @@ final class StatusBarContentView: NSView {
                 x += dividerWidth + segmentGap
             }
 
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: segment.completed ? NSColor.systemGreen : NSColor.labelColor
+            ]
             let string = segment.title as NSString
             let size = string.size(withAttributes: attributes)
             let rect = NSRect(
@@ -206,12 +217,10 @@ final class StatusBarContentView: NSView {
             )
             string.draw(in: rect, withAttributes: attributes)
 
-            if let item = segment.item {
-                hitRects.append((
-                    rect: rect.insetBy(dx: -segmentGap / 2, dy: -4),
-                    item: item
-                ))
-            }
+            hitRects.append((
+                rect: rect.insetBy(dx: -segmentGap / 2, dy: -4),
+                segment: segment
+            ))
             x += ceil(size.width) + segmentGap
         }
     }
@@ -223,8 +232,19 @@ final class StatusBarContentView: NSView {
         }
 
         let point = convert(event.locationInWindow, from: nil)
+        if iconContains(point) {
+            onMenuClick?()
+            return
+        }
+
         if let hit = hitRects.first(where: { $0.rect.contains(point) }) {
-            onSegmentClick?(hit.item)
+            if let item = hit.segment.item {
+                onSegmentClick?(item)
+            } else if hit.segment.opensCodex {
+                onOpenCodexClick?()
+            } else if hit.segment.opensMenu {
+                onConversationMenuClick?()
+            }
             return
         }
 
@@ -239,6 +259,24 @@ final class StatusBarContentView: NSView {
         true
     }
 
+    private func iconDrawRect() -> NSRect {
+        NSRect(
+            x: horizontalPadding,
+            y: (bounds.height - iconSize.height) / 2,
+            width: iconSize.width,
+            height: iconSize.height
+        )
+    }
+
+    private func textDrawBounds() -> NSRect {
+        NSRect(
+            x: horizontalPadding + iconSize.width,
+            y: 0,
+            width: max(0, bounds.width - horizontalPadding - iconSize.width),
+            height: bounds.height
+        )
+    }
+
     private func measuredWidth() -> CGFloat {
         let attributes: [NSAttributedString.Key: Any] = [.font: font]
         let textWidth = segments.reduce(CGFloat(0)) { partial, segment in
@@ -246,27 +284,22 @@ final class StatusBarContentView: NSView {
         }
         let dividerTotal = CGFloat(max(0, segments.count - 1)) * (dividerWidth + segmentGap)
         let segmentSpacing = CGFloat(max(0, segments.count)) * segmentGap
-        return horizontalPadding * 2 + iconSize.width + iconTextGap + textWidth + dividerTotal + segmentSpacing
+        let textGap = segments.isEmpty ? 0 : iconTextGap
+        return horizontalPadding * 2 + iconSize.width + textGap + textWidth + dividerTotal + segmentSpacing
     }
 
     func item(at point: NSPoint) -> ActiveItem? {
-        hitRects.first(where: { $0.rect.contains(point) })?.item
+        hitRects.first(where: { $0.rect.contains(point) })?.segment.item
     }
 
     func iconContains(_ point: NSPoint) -> Bool {
-        let iconRect = NSRect(
-            x: horizontalPadding,
-            y: (bounds.height - iconSize.height) / 2,
-            width: iconSize.width,
-            height: iconSize.height
-        )
-        return iconRect.insetBy(dx: -4, dy: -4).contains(point)
+        iconDrawRect().insetBy(dx: -4, dy: -4).contains(point)
     }
 }
 
 final class CodexStatusController: NSObject, NSMenuDelegate {
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    private let timerStripItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let statusBarView = StatusBarContentView(frame: NSRect(x: 0, y: 0, width: 26, height: 22))
     private let statusMenu = NSMenu()
     private let conversationMenu = NSMenu()
     private let home = FileManager.default.homeDirectoryForCurrentUser
@@ -297,6 +330,9 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private var cachedCodexRunning = false
     private var lastCodexProcessCheck = Date.distantPast
     private var settingsWindow: NSWindow?
+    private var lastRenderedIconKey = ""
+    private var lastRenderedSegmentsKey = "<unset>"
+    private var cachedStatusIcon: NSImage?
     private lazy var templateLogo = Bundle.main.path(forResource: "codexTemplate", ofType: "png").flatMap(NSImage.init(contentsOfFile:))
     private lazy var startupLogo = Bundle.main.path(forResource: "codexStartupLogo", ofType: "png").flatMap(NSImage.init(contentsOfFile:))
     private lazy var outlineLogo = Bundle.main.path(forResource: "codexOutlineLogo", ofType: "svg").flatMap(NSImage.init(contentsOfFile:))
@@ -478,17 +514,13 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         ensureUsageStoreExists()
 
         statusMenu.delegate = self
-        if let button = statusItem.button {
-            button.target = self
-            button.action = #selector(statusItemClicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        }
-        if let button = timerStripItem.button {
-            button.target = self
-            button.action = #selector(timerStripClicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        }
+        statusBarView.onMenuClick = { [weak self] in self?.showStatusMenu() }
+        statusBarView.onOpenCodexClick = { [weak self] in self?.openCodex() }
+        statusBarView.onConversationMenuClick = { [weak self] in self?.showConversationMenu() }
+        statusBarView.onSegmentClick = { [weak self] item in self?.openItem(item) }
+        statusItem.view = statusBarView
 
+        render()
         refresh()
 
         let timer = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
@@ -546,18 +578,6 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        showStatusMenu()
-    }
-
-    @objc private func timerStripClicked(_ sender: NSStatusBarButton) {
-        if snapshot.activeItems.count == 1, let item = snapshot.activeItems.first {
-            openItem(item)
-            return
-        }
-        showConversationMenu()
-    }
-
     @objc private func openConversationFromMenu(_ sender: NSMenuItem) {
         guard let payload = sender.representedObject as? ConversationMenuPayload else {
             openCodex()
@@ -579,10 +599,10 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         conversationMenu.removeAllItems()
 
         guard !snapshot.activeItems.isEmpty else {
-            let item = NSMenuItem(title: "No active chats", action: nil, keyEquivalent: "")
-            item.isEnabled = false
+            let item = NSMenuItem(title: "Open Codex", action: #selector(openCodex), keyEquivalent: "")
+            item.target = self
             conversationMenu.addItem(item)
-            timerStripItem.popUpMenu(conversationMenu)
+            statusItem.popUpMenu(conversationMenu)
             return
         }
 
@@ -613,7 +633,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             conversationMenu.addItem(entry)
         }
 
-        timerStripItem.popUpMenu(conversationMenu)
+        statusItem.popUpMenu(conversationMenu)
     }
 
     private func openItem(_ item: ActiveItem) {
@@ -1348,75 +1368,19 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     }
 
     private func render() {
-        renderLogo()
-        renderTimerItems()
-    }
+        let icon = currentStatusIcon()
+        let segments = showTimerStrip ? statusBarSegments() : []
+        let segmentsKey = statusBarSegmentsKey(segments)
 
-    private func renderLogo() {
-        guard let button = statusItem.button else { return }
-        statusItem.length = 26
-        let color: NSColor
-        switch snapshot.kind {
-        case .command:
-            color = activeColor
-        case .completed:
-            color = NSColor.systemTeal
-        case .running:
-            color = NSColor.systemTeal
-        case .idle:
-            color = NSColor.systemRed
-        }
-
-        button.title = ""
-        button.attributedTitle = NSAttributedString(string: "")
-        button.image = codexIcon(color: color, active: shouldAnimateIcon(), frame: animationFrame)
-        button.imagePosition = .imageOnly
-    }
-
-    private func renderTimerItems() {
-        guard showTimerStrip else {
-            timerStripItem.length = 0
-            if let button = timerStripItem.button {
-                button.title = ""
-                button.attributedTitle = NSAttributedString(string: "")
-                button.image = nil
-                button.action = nil
-                button.target = nil
-            }
-            return
-        }
-
-        let entries = menuBarTimerEntries()
-        let title = entries.map(\.title).joined(separator: " | ")
-        let overflow = max(0, snapshot.activeItems.count - max(1, maxMenuBarChats))
-        if overflow > 0 {
-            renderTimerStrip(title: title.isEmpty ? "+\(overflow)" : "\(title) | +\(overflow)", completed: false)
+        if segmentsKey != lastRenderedSegmentsKey {
+            statusBarView.configure(icon: icon, segments: segments, font: textFont)
+            let width = ceil(statusBarView.intrinsicContentSize.width)
+            statusItem.length = max(26, width)
+            statusBarView.frame = NSRect(x: 0, y: 0, width: statusItem.length, height: 22)
+            lastRenderedSegmentsKey = segmentsKey
         } else {
-            renderTimerStrip(title: title, completed: snapshot.kind == .completed)
+            statusBarView.updateIcon(icon)
         }
-    }
-
-    private func renderTimerStrip(title: String, completed: Bool) {
-        let displayTitle = title.isEmpty ? "No active chats" : title
-        timerStripItem.length = statusItemWidth(for: displayTitle)
-        guard let button = timerStripItem.button else { return }
-        button.image = nil
-        button.title = displayTitle
-        button.target = self
-        button.action = #selector(timerStripClicked(_:))
-        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        button.attributedTitle = NSAttributedString(
-            string: displayTitle,
-            attributes: [
-                .font: textFont,
-                .foregroundColor: completed ? activeColor : NSColor.labelColor
-            ]
-        )
-    }
-
-    private func statusItemWidth(for title: String) -> CGFloat {
-        let width = ceil((title as NSString).size(withAttributes: [.font: textFont]).width)
-        return max(30, width + 2)
     }
 
     private func shouldAnimateIcon() -> Bool {
@@ -1426,30 +1390,107 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         return false
     }
 
-    private func menuBarTimerEntries() -> [(title: String, item: ActiveItem?, completed: Bool)] {
+    private func renderLogo() {
+        statusBarView.updateIcon(currentStatusIcon())
+    }
+
+    private func currentStatusIcon() -> NSImage? {
+        let (color, colorKey) = statusIconColor()
+        let frameKey = shouldAnimateIcon() ? animationFrame : 0
+        let iconKey = "\(iconStyle.rawValue)|\(colorKey)|\(frameKey)|\(shimmerCycleFrames)"
+        if iconKey == lastRenderedIconKey, let cachedStatusIcon {
+            return cachedStatusIcon
+        }
+
+        let icon = codexIcon(color: color, active: shouldAnimateIcon(), frame: animationFrame)
+        cachedStatusIcon = icon
+        lastRenderedIconKey = iconKey
+        return icon
+    }
+
+    private func statusIconColor() -> (NSColor, String) {
+        let color: NSColor
+        let key: String
+        switch snapshot.kind {
+        case .command:
+            color = activeColor
+            key = "active"
+        case .completed:
+            color = NSColor.systemTeal
+            key = "completed"
+        case .running:
+            color = NSColor.systemTeal
+            key = "running"
+        case .idle:
+            color = NSColor.systemRed
+            key = "idle"
+        }
+        return (color, key)
+    }
+
+    private func statusBarSegments() -> [StatusBarContentView.Segment] {
+        let entries = menuBarTimerEntries()
+        let overflow = max(0, snapshot.activeItems.count - max(1, maxMenuBarChats))
+        let opensDirectly = snapshot.activeItems.count == 1
+        var segments = entries.map { entry in
+            StatusBarContentView.Segment(
+                title: entry.title,
+                item: opensDirectly ? entry.item : nil,
+                completed: entry.completed,
+                opensCodex: entry.opensCodex,
+                opensMenu: entry.opensMenu || (!opensDirectly && entry.item != nil)
+            )
+        }
+
+        if overflow > 0 {
+            segments.append(StatusBarContentView.Segment(
+                title: "+\(overflow)",
+                item: nil,
+                completed: false,
+                opensCodex: false,
+                opensMenu: true
+            ))
+        }
+
+        return segments
+    }
+
+    private func statusBarSegmentsKey(_ segments: [StatusBarContentView.Segment]) -> String {
+        segments.map { segment in
+            [
+                segment.title,
+                segment.item?.id ?? "",
+                segment.completed ? "1" : "0",
+                segment.opensCodex ? "1" : "0",
+                segment.opensMenu ? "1" : "0"
+            ].joined(separator: "\u{1f}")
+        }.joined(separator: "\u{1e}")
+    }
+
+    private func menuBarTimerEntries() -> [(title: String, item: ActiveItem?, completed: Bool, opensCodex: Bool, opensMenu: Bool)] {
         switch snapshot.kind {
         case .command:
             if !snapshot.activeItems.isEmpty {
                 return timerEntries(for: snapshot.activeItems, completed: false)
             }
-            return [(snapshot.startedAt.map { formatElapsed(since: $0) } ?? "active", nil, false)]
+            return [(snapshot.startedAt.map { formatElapsed(since: $0) } ?? "active", nil, false, false, true)]
         case .completed:
             return timerEntries(for: snapshot.activeItems, completed: true)
         case .running:
-            return [("No active chats", nil, false)]
+            return [("No active chats", nil, false, true, false)]
         case .idle:
-            return [("No active chats", nil, false)]
+            return [("No active chats", nil, false, true, false)]
         }
     }
 
-    private func timerEntries(for items: [ActiveItem], completed: Bool) -> [(title: String, item: ActiveItem?, completed: Bool)] {
+    private func timerEntries(for items: [ActiveItem], completed: Bool) -> [(title: String, item: ActiveItem?, completed: Bool, opensCodex: Bool, opensMenu: Bool)] {
         let visibleLimit = max(1, maxMenuBarChats)
-        return items.prefix(visibleLimit).map { item -> (title: String, item: ActiveItem?, completed: Bool) in
+        return items.prefix(visibleLimit).map { item -> (title: String, item: ActiveItem?, completed: Bool, opensCodex: Bool, opensMenu: Bool) in
             if completed, let startedAt = item.startedAt, let completedAt = item.completedAt {
-                return (formatDuration(from: startedAt, to: completedAt), item, true)
+                return (formatDuration(from: startedAt, to: completedAt), item, true, false, false)
             }
 
-            return (item.startedAt.map { formatElapsed(since: $0) } ?? "active", item, false)
+            return (item.startedAt.map { formatElapsed(since: $0) } ?? "active", item, false, false, false)
         }
     }
 
@@ -1550,13 +1591,31 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     }
 
     private func readRecentRolloutSessions(titleIndex: [String: String]) -> [RolloutSession] {
-        let indexedSessions = readRecentThreadIndexEntries()
-        if !indexedSessions.isEmpty {
-            return indexedSessions
-                .compactMap { readRolloutSession(from: $0, titleIndex: titleIndex) }
-                .sorted { $0.updatedAt > $1.updatedAt }
+        var sessionsById: [String: RolloutSession] = [:]
+        var indexedPaths = Set<String>()
+
+        readRecentThreadIndexEntries()
+            .compactMap { entry -> RolloutSession? in
+                indexedPaths.insert(entry.rolloutPath)
+                return readRolloutSession(from: entry, titleIndex: titleIndex)
+            }
+            .forEach { session in
+                sessionsById[session.id] = session
+            }
+
+        let discoveredSessions = readRecentRolloutFiles(excluding: indexedPaths, titleIndex: titleIndex)
+        for session in discoveredSessions {
+            if let existing = sessionsById[session.id] {
+                sessionsById[session.id] = mergeRolloutSession(existing, with: session)
+            } else {
+                sessionsById[session.id] = session
+            }
         }
 
+        return sessionsById.values.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func readRecentRolloutFiles(excluding indexedPaths: Set<String>, titleIndex: [String: String]) -> [RolloutSession] {
         let candidateURLs = (FileManager.default.enumerator(
             at: sessionsRoot,
             includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
@@ -1564,7 +1623,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         )?.compactMap { $0 as? URL }) ?? []
 
         return candidateURLs
-            .filter { $0.pathExtension == "jsonl" }
+            .filter { $0.pathExtension == "jsonl" && !indexedPaths.contains($0.path) }
             .compactMap { url -> RolloutSession? in
                 guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
                       let updatedAt = values.contentModificationDate,
@@ -1572,6 +1631,24 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                 return readRolloutSession(at: url, updatedAt: updatedAt, titleIndex: titleIndex)
             }
             .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func mergeRolloutSession(_ primary: RolloutSession, with discovered: RolloutSession) -> RolloutSession {
+        let preferDiscoveredTurnState = discovered.turnId != nil || discovered.hasTurnState
+        return RolloutSession(
+            id: primary.id,
+            title: primary.title ?? discovered.title,
+            cwd: primary.cwd ?? discovered.cwd,
+            path: primary.path,
+            threadSource: primary.threadSource ?? discovered.threadSource,
+            updatedAt: max(primary.updatedAt, discovered.updatedAt),
+            turnId: preferDiscoveredTurnState ? discovered.turnId : primary.turnId,
+            turnStartedAt: preferDiscoveredTurnState ? discovered.turnStartedAt : primary.turnStartedAt,
+            turnCompletedAt: preferDiscoveredTurnState ? discovered.turnCompletedAt : primary.turnCompletedAt,
+            turnCompletionReason: preferDiscoveredTurnState ? discovered.turnCompletionReason : primary.turnCompletionReason,
+            isTurnActive: preferDiscoveredTurnState ? discovered.isTurnActive : primary.isTurnActive,
+            hasTurnState: preferDiscoveredTurnState ? discovered.hasTurnState : primary.hasTurnState
+        )
     }
 
     private func readRecentThreadIndexEntries() -> [ThreadIndexEntry] {
