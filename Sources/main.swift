@@ -1529,7 +1529,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size)
         let shimmerStart: CGFloat = 0.08
-        let shimmerDuration: CGFloat = 0.62
+        let shimmerDuration: CGFloat = 0.60
         let shimmerActive = active && phase >= shimmerStart && phase <= shimmerStart + shimmerDuration
         let sweepProgress = max(0, min(1, (phase - shimmerStart) / shimmerDuration))
 
@@ -1562,12 +1562,14 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                 context?.saveGState()
                 context?.clip(to: rect, mask: cgImage)
 
-                let sweepWidth = size.width * 0.68
+                let sweepWidth = size.width * 0.58
                 let x = -sweepWidth + (size.width + sweepWidth * 2.2) * sweepProgress
                 let sweepRect = NSRect(x: x, y: 0, width: sweepWidth, height: size.height)
                 let gradient = NSGradient(colors: [
                     NSColor.white.withAlphaComponent(0.0),
-                    NSColor.white.withAlphaComponent(0.46),
+                    NSColor.white.withAlphaComponent(0.30),
+                    NSColor.white.withAlphaComponent(0.75),
+                    NSColor.white.withAlphaComponent(0.30),
                     NSColor.white.withAlphaComponent(0.0)
                 ])
                 gradient?.draw(in: sweepRect, angle: 0)
