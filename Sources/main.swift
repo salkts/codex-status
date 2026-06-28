@@ -303,9 +303,9 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private let statusMenu = NSMenu()
     private let conversationMenu = NSMenu()
     private let home = FileManager.default.homeDirectoryForCurrentUser
-    private let pollInterval: TimeInterval = 1.0
+    private let pollInterval: TimeInterval = 2.5
     private let displayInterval: TimeInterval = 1.0
-    private let animationInterval: TimeInterval = 1.0 / 24.0
+    private let animationInterval: TimeInterval = 1.0 / 12.0
     private let recentWindow: TimeInterval = 10 * 60
     private let activeWriteWindow: TimeInterval = 10 * 60
     private let activeTurnStaleWindow: TimeInterval = 24 * 60 * 60
@@ -333,6 +333,8 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private var lastRenderedIconKey = ""
     private var lastRenderedSegmentsKey = "<unset>"
     private var cachedStatusIcon: NSImage?
+    private var cachedStatusIcons: [String: NSImage] = [:]
+    private var rolloutSessionCache: [String: (contentUpdatedAt: Date, session: RolloutSession)] = [:]
     private lazy var templateLogo = Bundle.main.path(forResource: "codexTemplate", ofType: "png").flatMap(NSImage.init(contentsOfFile:))
     private lazy var startupLogo = Bundle.main.path(forResource: "codexStartupLogo", ofType: "png").flatMap(NSImage.init(contentsOfFile:))
     private lazy var outlineLogo = Bundle.main.path(forResource: "codexOutlineLogo", ofType: "svg").flatMap(NSImage.init(contentsOfFile:))
@@ -1401,8 +1403,17 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         if iconKey == lastRenderedIconKey, let cachedStatusIcon {
             return cachedStatusIcon
         }
+        if let icon = cachedStatusIcons[iconKey] {
+            cachedStatusIcon = icon
+            lastRenderedIconKey = iconKey
+            return icon
+        }
 
         let icon = codexIcon(color: color, active: shouldAnimateIcon(), frame: animationFrame)
+        if cachedStatusIcons.count > 192 {
+            cachedStatusIcons.removeAll(keepingCapacity: true)
+        }
+        cachedStatusIcons[iconKey] = icon
         cachedStatusIcon = icon
         lastRenderedIconKey = iconKey
         return icon
@@ -1668,7 +1679,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
           and rollout_path <> ''
           and max(coalesce(updated_at_ms, 0), coalesce(recency_at_ms, 0)) >= \(Int(cutoffMs))
         order by touched_at_ms desc
-        limit 80;
+        limit 24;
         """
 
         let task = Process()
@@ -1693,15 +1704,36 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private func readRolloutSession(from entry: ThreadIndexEntry, titleIndex: [String: String]) -> RolloutSession? {
         guard FileManager.default.fileExists(atPath: entry.rolloutPath) else { return nil }
         let url = URL(fileURLWithPath: entry.rolloutPath)
+        let contentUpdatedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date(timeIntervalSince1970: entry.touchedAtMs / 1000)
+        let indexedUpdatedAt = Date(timeIntervalSince1970: entry.touchedAtMs / 1000)
+        if let cached = rolloutSessionCache[entry.rolloutPath],
+           cached.contentUpdatedAt == contentUpdatedAt {
+            let session = cached.session
+            return RolloutSession(
+                id: entry.id,
+                title: titleIndex[entry.id] ?? entry.title ?? session.title,
+                cwd: entry.cwd ?? session.cwd,
+                path: entry.rolloutPath,
+                threadSource: entry.threadSource ?? session.threadSource,
+                updatedAt: max(indexedUpdatedAt, contentUpdatedAt),
+                turnId: session.turnId,
+                turnStartedAt: session.turnStartedAt,
+                turnCompletedAt: session.turnCompletedAt,
+                turnCompletionReason: session.turnCompletionReason,
+                isTurnActive: session.isTurnActive,
+                hasTurnState: session.hasTurnState
+            )
+        }
+
         let turnState = readRolloutTurnState(at: url)
 
-        return RolloutSession(
+        let session = RolloutSession(
             id: entry.id,
             title: titleIndex[entry.id] ?? entry.title,
             cwd: entry.cwd,
             path: entry.rolloutPath,
             threadSource: entry.threadSource,
-            updatedAt: Date(timeIntervalSince1970: entry.touchedAtMs / 1000),
+            updatedAt: max(indexedUpdatedAt, contentUpdatedAt),
             turnId: turnState.turnId,
             turnStartedAt: turnState.startedAt,
             turnCompletedAt: turnState.completedAt,
@@ -1709,9 +1741,30 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             isTurnActive: turnState.isActive,
             hasTurnState: turnState.hasState
         )
+        cacheRolloutSession(session, contentUpdatedAt: contentUpdatedAt)
+        return session
     }
 
     private func readRolloutSession(at url: URL, updatedAt: Date, titleIndex: [String: String]) -> RolloutSession? {
+        if let cached = rolloutSessionCache[url.path],
+           cached.contentUpdatedAt == updatedAt {
+            let session = cached.session
+            return RolloutSession(
+                id: session.id,
+                title: titleIndex[session.id] ?? session.title,
+                cwd: session.cwd,
+                path: session.path,
+                threadSource: session.threadSource,
+                updatedAt: updatedAt,
+                turnId: session.turnId,
+                turnStartedAt: session.turnStartedAt,
+                turnCompletedAt: session.turnCompletedAt,
+                turnCompletionReason: session.turnCompletionReason,
+                isTurnActive: session.isTurnActive,
+                hasTurnState: session.hasTurnState
+            )
+        }
+
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: 1024 * 1024),
@@ -1724,7 +1777,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
               let id = payload["id"] as? String else { return nil }
         let turnState = readRolloutTurnState(at: url)
 
-        return RolloutSession(
+        let session = RolloutSession(
             id: id,
             title: titleIndex[id] ?? payload["thread_name"] as? String ?? payload["agent_nickname"] as? String,
             cwd: payload["cwd"] as? String,
@@ -1738,6 +1791,18 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             isTurnActive: turnState.isActive,
             hasTurnState: turnState.hasState
         )
+        cacheRolloutSession(session, contentUpdatedAt: updatedAt)
+        return session
+    }
+
+    private func cacheRolloutSession(_ session: RolloutSession, contentUpdatedAt: Date) {
+        rolloutSessionCache[session.path] = (contentUpdatedAt, session)
+        guard rolloutSessionCache.count > 256 else { return }
+        let oldestKeys = rolloutSessionCache
+            .sorted { $0.value.contentUpdatedAt < $1.value.contentUpdatedAt }
+            .prefix(rolloutSessionCache.count - 256)
+            .map(\.key)
+        oldestKeys.forEach { rolloutSessionCache.removeValue(forKey: $0) }
     }
 
     private func readSessionTitleIndex() -> [String: String] {
