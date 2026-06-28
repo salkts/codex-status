@@ -319,7 +319,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private let defaults = UserDefaults.standard
     private let stateQueue = DispatchQueue(label: "codex-status.state", qos: .utility)
     private let watchQueue = DispatchQueue(label: "codex-status.watch", qos: .utility)
-    private var animationFrame = 0
+    private var animationStartedAt = Date()
     private var completedAnimationStart: Date?
     private var lastCompletedIds = Set<String>()
     private var refreshInFlight = false
@@ -369,13 +369,24 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         }
     }
 
-    private var shimmerCycleFrames: Int {
+    private var shimmerCycleSeconds: TimeInterval {
         get {
-            let value = defaults.integer(forKey: "shimmerCycleFrames")
-            return value > 0 ? value : 48
+            let value = defaults.double(forKey: "shimmerCycleSeconds")
+            if value > 0 {
+                return value
+            }
+
+            let oldFrameValue = defaults.integer(forKey: "shimmerCycleFrames")
+            if oldFrameValue > 0 {
+                return max(1.5, min(6.0, TimeInterval(oldFrameValue) / 24.0))
+            }
+
+            return 2.5
         }
         set {
-            defaults.set(max(24, min(144, newValue)), forKey: "shimmerCycleFrames")
+            defaults.set(max(1.5, min(6.0, newValue)), forKey: "shimmerCycleSeconds")
+            cachedStatusIcons.removeAll(keepingCapacity: true)
+            render()
         }
     }
 
@@ -540,7 +551,6 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         let animationTimer = Timer(timeInterval: animationInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
             if self.shouldAnimateIcon() {
-                self.animationFrame = (self.animationFrame + 1) % self.shimmerCycleFrames
                 self.renderLogo()
             }
         }
@@ -873,8 +883,8 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         let shimmerControl = NSSegmentedControl(labels: ["Often", "Normal", "Calm"], trackingMode: .selectOne, target: self, action: #selector(changeShimmerCadence(_:)))
         shimmerControl.frame = NSRect(x: 382, y: 16, width: 182, height: 28)
         shimmerControl.segmentStyle = .rounded
-        let frames = shimmerCycleFrames
-        shimmerControl.selectedSegment = frames <= 48 ? 0 : frames <= 96 ? 1 : 2
+        let cadence = shimmerCycleSeconds
+        shimmerControl.selectedSegment = cadence <= 2.5 ? 0 : cadence <= 4.0 ? 1 : 2
         menuGroup.addSubview(shimmerControl)
 
         window.contentView = content
@@ -994,11 +1004,11 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     @objc private func changeShimmerCadence(_ sender: NSSegmentedControl) {
         switch sender.selectedSegment {
         case 0:
-            shimmerCycleFrames = 48
+            shimmerCycleSeconds = 2.5
         case 2:
-            shimmerCycleFrames = 120
+            shimmerCycleSeconds = 6.0
         default:
-            shimmerCycleFrames = 72
+            shimmerCycleSeconds = 4.0
         }
     }
 
@@ -1398,8 +1408,10 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
 
     private func currentStatusIcon() -> NSImage? {
         let (color, colorKey) = statusIconColor()
-        let frameKey = shouldAnimateIcon() ? animationFrame : 0
-        let iconKey = "\(iconStyle.rawValue)|\(colorKey)|\(frameKey)|\(shimmerCycleFrames)"
+        let phase = currentShimmerPhase()
+        let phaseBucket = shouldAnimateIcon() ? Int((phase * 120).rounded(.down)) : 0
+        let cadenceKey = String(format: "%.2f", shimmerCycleSeconds)
+        let iconKey = "\(iconStyle.rawValue)|\(colorKey)|\(phaseBucket)|\(cadenceKey)"
         if iconKey == lastRenderedIconKey, let cachedStatusIcon {
             return cachedStatusIcon
         }
@@ -1409,7 +1421,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             return icon
         }
 
-        let icon = codexIcon(color: color, active: shouldAnimateIcon(), frame: animationFrame)
+        let icon = codexIcon(color: color, active: shouldAnimateIcon(), phase: phase)
         if cachedStatusIcons.count > 192 {
             cachedStatusIcons.removeAll(keepingCapacity: true)
         }
@@ -1417,6 +1429,14 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         cachedStatusIcon = icon
         lastRenderedIconKey = iconKey
         return icon
+    }
+
+    private func currentShimmerPhase() -> CGFloat {
+        guard shouldAnimateIcon() else { return 0 }
+        let cadence = max(0.1, shimmerCycleSeconds)
+        let elapsed = Date().timeIntervalSince(animationStartedAt)
+        let progress = elapsed.truncatingRemainder(dividingBy: cadence) / cadence
+        return CGFloat(progress)
     }
 
     private func statusIconColor() -> (NSColor, String) {
@@ -1505,13 +1525,13 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func codexIcon(color: NSColor, active: Bool, frame: Int) -> NSImage {
+    private func codexIcon(color: NSColor, active: Bool, phase: CGFloat) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size)
-        let cycle = max(1, shimmerCycleFrames)
-        let phase = CGFloat(frame % cycle) / CGFloat(cycle)
-        let shimmerActive = active && phase >= 0.08 && phase <= 0.58
-        let sweepProgress = max(0, min(1, (phase - 0.08) / 0.50))
+        let shimmerStart: CGFloat = 0.08
+        let shimmerDuration: CGFloat = 0.62
+        let shimmerActive = active && phase >= shimmerStart && phase <= shimmerStart + shimmerDuration
+        let sweepProgress = max(0, min(1, (phase - shimmerStart) / shimmerDuration))
 
         image.lockFocus()
         NSGraphicsContext.current?.imageInterpolation = .high
@@ -1542,12 +1562,12 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                 context?.saveGState()
                 context?.clip(to: rect, mask: cgImage)
 
-                let sweepWidth = size.width * 0.55
-                let x = -sweepWidth + (size.width + sweepWidth * 2.5) * sweepProgress
+                let sweepWidth = size.width * 0.68
+                let x = -sweepWidth + (size.width + sweepWidth * 2.2) * sweepProgress
                 let sweepRect = NSRect(x: x, y: 0, width: sweepWidth, height: size.height)
                 let gradient = NSGradient(colors: [
                     NSColor.white.withAlphaComponent(0.0),
-                    NSColor.white.withAlphaComponent(0.65),
+                    NSColor.white.withAlphaComponent(0.46),
                     NSColor.white.withAlphaComponent(0.0)
                 ])
                 gradient?.draw(in: sweepRect, angle: 0)
