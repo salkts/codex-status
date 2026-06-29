@@ -1,6 +1,9 @@
 import Cocoa
 import Foundation
 import ServiceManagement
+#if canImport(Sparkle)
+import Sparkle
+#endif
 
 struct SessionIndexEntry: Decodable {
     let id: String
@@ -38,6 +41,16 @@ struct RolloutSession {
     let turnCompletionReason: String?
     let isTurnActive: Bool
     let hasTurnState: Bool
+}
+
+struct CompletedTurnRecord {
+    let threadId: String
+    let turnId: String
+    let path: String
+    let sourceType: String
+    let startedAt: Date
+    let completedAt: Date
+    let completionReason: String
 }
 
 struct ThreadIndexEntry: Decodable {
@@ -120,6 +133,15 @@ struct StatusSnapshot {
     let activeItems: [ActiveItem]
 }
 
+enum UpdateState: Equatable {
+    case idle
+    case checking
+    case available(version: String, url: URL?)
+    case downloading
+    case installing
+    case error(String)
+}
+
 final class ConversationMenuPayload: NSObject {
     let id: String
     let clearsWhenOpened: Bool
@@ -146,6 +168,7 @@ final class StatusBarContentView: NSView {
     var onOpenCodexClick: (() -> Void)?
     var onMenuClick: (() -> Void)?
     var onConversationMenuClick: (() -> Void)?
+    var showsUpdateBadge = false
 
     private var hitRects: [(rect: NSRect, segment: Segment)] = []
     private let iconSize = NSSize(width: 18, height: 18)
@@ -159,17 +182,19 @@ final class StatusBarContentView: NSView {
         NSSize(width: measuredWidth(), height: height)
     }
 
-    func configure(icon: NSImage?, segments: [Segment], font: NSFont) {
+    func configure(icon: NSImage?, segments: [Segment], font: NSFont, showsUpdateBadge: Bool) {
         self.icon = icon
         self.segments = segments
         self.font = font
+        self.showsUpdateBadge = showsUpdateBadge
         invalidateIntrinsicContentSize()
         needsDisplay = true
     }
 
-    func updateIcon(_ icon: NSImage?) {
+    func updateIcon(_ icon: NSImage?, showsUpdateBadge: Bool) {
         self.icon = icon
-        setNeedsDisplay(iconDrawRect().insetBy(dx: -1, dy: -1))
+        self.showsUpdateBadge = showsUpdateBadge
+        setNeedsDisplay(iconDrawRect().insetBy(dx: -3, dy: -3))
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -178,6 +203,7 @@ final class StatusBarContentView: NSView {
         var x = horizontalPadding
         if let icon {
             icon.draw(in: iconDrawRect())
+            drawUpdateBadgeIfNeeded()
         }
         x += iconSize.width
         if !dirtyRect.intersects(textDrawBounds()) && !hitRects.isEmpty {
@@ -268,6 +294,16 @@ final class StatusBarContentView: NSView {
         )
     }
 
+    private func drawUpdateBadgeIfNeeded() {
+        guard showsUpdateBadge else { return }
+        let rect = iconDrawRect()
+        let pulse = (sin(Date().timeIntervalSinceReferenceDate * 4.0) + 1) / 2
+        let alpha = 0.55 + 0.35 * pulse
+        let badge = NSRect(x: rect.maxX - 4, y: rect.maxY - 5, width: 6, height: 6)
+        NSColor.systemBlue.withAlphaComponent(alpha).setFill()
+        NSBezierPath(ovalIn: badge).fill()
+    }
+
     private func textDrawBounds() -> NSRect {
         NSRect(
             x: horizontalPadding + iconSize.width,
@@ -303,12 +339,17 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private let statusMenu = NSMenu()
     private let conversationMenu = NSMenu()
     private let home = FileManager.default.homeDirectoryForCurrentUser
+    private let repositoryURL = URL(string: "https://github.com/salkts/codex-status")!
+    private let latestCommitURL = URL(string: "https://api.github.com/repos/salkts/codex-status/commits/main")!
     private let pollInterval: TimeInterval = 2.5
     private let displayInterval: TimeInterval = 1.0
     private let animationInterval: TimeInterval = 1.0 / 12.0
     private let recentWindow: TimeInterval = 10 * 60
     private let activeWriteWindow: TimeInterval = 10 * 60
     private let activeTurnStaleWindow: TimeInterval = 24 * 60 * 60
+    private let usageBackfillWindow: TimeInterval = 24 * 60 * 60
+    private let usageBackfillMaxFiles = 48
+    private let usageBackfillMaxBytes: UInt64 = 2 * 1024 * 1024 * 1024
     private let completedFinishMinimum: TimeInterval = 5 * 60
     private let completedRetentionWindow: TimeInterval = 10
     private let staleCommandWindow: TimeInterval = 24 * 60 * 60
@@ -335,6 +376,16 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private var cachedStatusIcon: NSImage?
     private var cachedStatusIcons: [String: NSImage] = [:]
     private var rolloutSessionCache: [String: (contentUpdatedAt: Date, session: RolloutSession)] = [:]
+    private var rolloutPathByThreadIdCache: [String: String?] = [:]
+    private var usageRepairDidRunThisLaunch = false
+    private var usageBackfillDidRunThisLaunch = false
+    private var updateState: UpdateState = .idle
+    private var updateCheckInFlight = false
+    private var lastUpdateCheck = Date.distantPast
+    private var usageMaintenanceInFlight = false
+#if canImport(Sparkle)
+    private var updaterController: SPUStandardUpdaterController?
+#endif
     private lazy var templateLogo = Bundle.main.path(forResource: "codexTemplate", ofType: "png").flatMap(NSImage.init(contentsOfFile:))
     private lazy var startupLogo = Bundle.main.path(forResource: "codexStartupLogo", ofType: "png").flatMap(NSImage.init(contentsOfFile:))
     private lazy var outlineLogo = Bundle.main.path(forResource: "codexOutlineLogo", ofType: "svg").flatMap(NSImage.init(contentsOfFile:))
@@ -474,6 +525,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     private var timer: Timer?
     private var displayTimer: Timer?
     private var animationTimer: Timer?
+    private var updateTimer: Timer?
     private var snapshot = StatusSnapshot(
         kind: .idle,
         title: "Codex",
@@ -533,8 +585,12 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         statusBarView.onSegmentClick = { [weak self] item in self?.openItem(item) }
         statusItem.view = statusBarView
 
+        configureUpdater()
         render()
         refresh()
+        runUsageMaintenanceSoon()
+        checkForUpdatesIfNeeded(force: false)
+        scheduleMidnightUpdateCheck()
 
         let timer = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -567,6 +623,11 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
+        if let updateItem = updateMenuItem() {
+            menu.addItem(updateItem)
+            menu.addItem(.separator())
+        }
+
         let open = NSMenuItem(title: "Open Codex", action: #selector(openCodex), keyEquivalent: "")
         open.target = self
         menu.addItem(open)
@@ -580,6 +641,113 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         let quit = NSMenuItem(title: "Quit Codex Status", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+    }
+
+    private func updateMenuItem() -> NSMenuItem? {
+        switch updateState {
+        case .idle:
+            return nil
+        case .checking:
+            let item = NSMenuItem(title: "Checking for updates...", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            return item
+        case .available:
+            let item = NSMenuItem(title: "Update available", action: #selector(installAvailableUpdate), keyEquivalent: "")
+            item.target = self
+            return item
+        case .downloading:
+            let item = NSMenuItem(title: "Downloading update...", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            return item
+        case .installing:
+            let item = NSMenuItem(title: "Installing update...", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            return item
+        case .error:
+            let item = NSMenuItem(title: "Update check failed", action: #selector(openReleasesPage), keyEquivalent: "")
+            item.target = self
+            return item
+        }
+    }
+
+    @objc private func installAvailableUpdate() {
+#if canImport(Sparkle)
+        if let updater = updaterController?.updater, updater.canCheckForUpdates {
+            updateState = .downloading
+            render()
+            updater.checkForUpdates()
+            return
+        }
+#endif
+        openReleasesPage()
+    }
+
+    @objc private func openReleasesPage() {
+        NSWorkspace.shared.open(repositoryURL.appendingPathComponent("releases"))
+    }
+
+    private func configureUpdater() {
+#if canImport(Sparkle)
+        guard Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String != nil else { return }
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+#endif
+    }
+
+    private func checkForUpdatesIfNeeded(force: Bool) {
+        guard force || Date().timeIntervalSince(lastUpdateCheck) >= 24 * 60 * 60 else { return }
+        guard !updateCheckInFlight else { return }
+        updateCheckInFlight = true
+        lastUpdateCheck = Date()
+        updateState = .checking
+        render()
+
+        var request = URLRequest(url: latestCommitURL)
+        request.setValue("Codex Status", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let self else { return }
+            var nextState: UpdateState = .idle
+            defer {
+                DispatchQueue.main.async {
+                    self.updateCheckInFlight = false
+                    self.updateState = nextState
+                    self.render()
+                }
+            }
+
+            guard error == nil,
+                  let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sha = obj["sha"] as? String else {
+                nextState = .idle
+                return
+            }
+
+            let currentCommit = (Bundle.main.object(forInfoDictionaryKey: "CodexStatusGitCommit") as? String) ?? ""
+            if !currentCommit.isEmpty && !sha.hasPrefix(currentCommit) && !currentCommit.hasPrefix(sha) {
+                nextState = .available(version: String(sha.prefix(7)), url: self.repositoryURL.appendingPathComponent("releases"))
+            } else {
+                nextState = .idle
+            }
+        }.resume()
+    }
+
+    private func scheduleMidnightUpdateCheck() {
+        updateTimer?.invalidate()
+        let calendar = Calendar.current
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: Date()) ?? Date().addingTimeInterval(24 * 60 * 60)
+        let midnight = calendar.startOfDay(for: tomorrow)
+        let timer = Timer(fireAt: midnight, interval: 0, target: self, selector: #selector(runScheduledUpdateCheck), userInfo: nil, repeats: false)
+        RunLoop.main.add(timer, forMode: .common)
+        updateTimer = timer
+    }
+
+    @objc private func runScheduledUpdateCheck() {
+        checkForUpdatesIfNeeded(force: true)
+        scheduleMidnightUpdateCheck()
     }
 
     @objc private func openCodex() {
@@ -1056,6 +1224,22 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         }
     }
 
+    private func runUsageMaintenanceSoon() {
+        guard !usageMaintenanceInFlight else { return }
+        usageMaintenanceInFlight = true
+        stateQueue.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self else { return }
+            let now = Date()
+            self.repairStoredUsageDurationsIfNeeded(now: now)
+            self.backfillRecentUsageIfNeeded(now: now)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.usageMaintenanceInFlight = false
+                self.updateSettingsUsageStats()
+            }
+        }
+    }
+
     private func refresh() {
         guard !refreshInFlight else {
             pendingRefresh = true
@@ -1108,8 +1292,6 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             guard completedAt >= store.trackingStartedAt else { continue }
             let duration = max(0, Int(completedAt.timeIntervalSince(startedAt)))
             let key = usageDedupeKey(for: rollout, startedAt: startedAt, completedAt: completedAt, duration: duration)
-            guard !keys.contains(key) else { continue }
-            keys.insert(key)
             let sourceType = normalizedSourceType(rollout.threadSource)
             let session = UsageSession(
                 dedupeKey: key,
@@ -1124,15 +1306,281 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                 observedLastAt: now,
                 appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
             )
-            store.sessions.append(session)
-            upsertDailyRollup(for: session, in: &store)
+            if let existingIndex = store.sessions.firstIndex(where: { $0.dedupeKey == key }) {
+                let existing = store.sessions[existingIndex]
+                if shouldReplaceUsageSession(existing, with: session) {
+                    store.sessions[existingIndex] = UsageSession(
+                        dedupeKey: existing.dedupeKey,
+                        threadId: session.threadId,
+                        turnId: session.turnId,
+                        sourceType: session.sourceType,
+                        startedAt: session.startedAt,
+                        completedAt: session.completedAt,
+                        durationSeconds: session.durationSeconds,
+                        completionReason: session.completionReason,
+                        observedFirstAt: existing.observedFirstAt,
+                        observedLastAt: now,
+                        appVersion: session.appVersion
+                    )
+                    changed = true
+                }
+            } else {
+                keys.insert(key)
+                store.sessions.append(session)
+                changed = true
+            }
+        }
+
+        guard changed else { return }
+        store.recordedKeys = Array(keys.union(store.sessions.map(\.dedupeKey)))
+        compactUsageStore(&store, now: now)
+        rebuildDailyRollups(in: &store)
+        writeUsageStore(store)
+    }
+
+    private func shouldReplaceUsageSession(_ existing: UsageSession, with candidate: UsageSession) -> Bool {
+        candidate.durationSeconds > existing.durationSeconds
+            || candidate.startedAt < existing.startedAt
+            || candidate.completedAt != existing.completedAt
+            || candidate.sourceType != existing.sourceType
+            || candidate.completionReason != existing.completionReason
+    }
+
+    private func repairStoredUsageDurationsIfNeeded(now: Date) {
+        guard !usageRepairDidRunThisLaunch else { return }
+        usageRepairDidRunThisLaunch = true
+
+        var store = readUsageStore(now: now)
+        let candidates = store.sessions
+            .filter { $0.turnId != nil }
+            .sorted { lhs, rhs in
+                if lhs.durationSeconds == rhs.durationSeconds {
+                    return lhs.completedAt > rhs.completedAt
+                }
+                return lhs.durationSeconds > rhs.durationSeconds
+            }
+            .prefix(16)
+
+        var changed = false
+        for session in candidates {
+            guard let turnId = session.turnId,
+                  let sessionIndex = store.sessions.firstIndex(where: { $0.dedupeKey == session.dedupeKey }),
+                  let path = rolloutPath(forThreadId: session.threadId) else { continue }
+            let url = URL(fileURLWithPath: path)
+            guard let startedAt = readTaskStartedAt(in: url, turnId: turnId),
+                  startedAt < session.startedAt else { continue }
+            let duration = max(0, Int(session.completedAt.timeIntervalSince(startedAt)))
+            guard duration > session.durationSeconds else { continue }
+            store.sessions[sessionIndex] = UsageSession(
+                dedupeKey: session.dedupeKey,
+                threadId: session.threadId,
+                turnId: session.turnId,
+                sourceType: session.sourceType,
+                startedAt: startedAt,
+                completedAt: session.completedAt,
+                durationSeconds: duration,
+                completionReason: session.completionReason,
+                observedFirstAt: session.observedFirstAt,
+                observedLastAt: now,
+                appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? session.appVersion
+            )
             changed = true
         }
 
         guard changed else { return }
-        store.recordedKeys = Array(keys)
+        store.recordedKeys = Array(Set(store.sessions.map(\.dedupeKey)))
         compactUsageStore(&store, now: now)
+        rebuildDailyRollups(in: &store)
         writeUsageStore(store)
+    }
+
+    private func backfillRecentUsageIfNeeded(now: Date) {
+        guard !usageBackfillDidRunThisLaunch else { return }
+        usageBackfillDidRunThisLaunch = true
+
+        let urls = recentRolloutURLsForUsageBackfill(now: now)
+        guard !urls.isEmpty else { return }
+
+        var store = readUsageStore(now: now)
+        var changed = false
+        for url in urls {
+            for record in readCompletedTurnsForUsageBackfill(at: url) {
+                guard record.completedAt >= store.trackingStartedAt,
+                      record.completedAt >= record.startedAt,
+                      record.completedAt.timeIntervalSince(record.startedAt) >= 5 else { continue }
+                changed = upsertUsageRecord(record, in: &store, now: now) || changed
+            }
+        }
+
+        guard changed else { return }
+        store.recordedKeys = Array(Set(store.sessions.map(\.dedupeKey)))
+        compactUsageStore(&store, now: now)
+        rebuildDailyRollups(in: &store)
+        writeUsageStore(store)
+    }
+
+    private func recentRolloutURLsForUsageBackfill(now: Date) -> [URL] {
+        let cutoff = now.addingTimeInterval(-usageBackfillWindow)
+        let candidates = (FileManager.default.enumerator(
+            at: sessionsRoot,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )?.compactMap { $0 as? URL }) ?? []
+
+        var selected: [(url: URL, updatedAt: Date, size: UInt64)] = []
+        for url in candidates where url.pathExtension == "jsonl" {
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let updatedAt = values.contentModificationDate,
+                  updatedAt >= cutoff else { continue }
+            selected.append((url, updatedAt, UInt64(values.fileSize ?? 0)))
+        }
+
+        var totalBytes: UInt64 = 0
+        var urls: [URL] = []
+        for candidate in selected.sorted(by: { $0.updatedAt > $1.updatedAt }) {
+            guard urls.count < usageBackfillMaxFiles else { break }
+            guard totalBytes + candidate.size <= usageBackfillMaxBytes || urls.isEmpty else { break }
+            urls.append(candidate.url)
+            totalBytes += candidate.size
+        }
+        return urls
+    }
+
+    private func readCompletedTurnsForUsageBackfill(at url: URL) -> [CompletedTurnRecord] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+
+        var threadId: String?
+        var sourceType = "main"
+        var startedAtByTurnId: [String: Date] = [:]
+        var completed: [CompletedTurnRecord] = []
+
+        processJSONLines(from: handle) { obj in
+            guard let type = obj["type"] as? String else { return }
+            let timestamp = (obj["timestamp"] as? String).flatMap { ISO8601DateFormatter.codexAny.date(from: $0) }
+
+            if type == "session_meta",
+               let payload = obj["payload"] as? [String: Any] {
+                threadId = payload["id"] as? String ?? threadId
+                sourceType = normalizedSourceType(payload["thread_source"] as? String)
+                return
+            }
+
+            guard let payload = obj["payload"] as? [String: Any] else { return }
+            if type == "event_msg",
+               payload["type"] as? String == "task_started",
+               let turnId = payload["turn_id"] as? String,
+               let timestamp {
+                startedAtByTurnId[turnId] = min(startedAtByTurnId[turnId] ?? timestamp, timestamp)
+            } else if type == "event_msg",
+                      payload["type"] as? String == "task_complete",
+                      let turnId = payload["turn_id"] as? String,
+                      let threadId,
+                      let startedAt = startedAtByTurnId[turnId],
+                      let completedAt = completedAt(from: payload, fallback: timestamp) {
+                completed.append(CompletedTurnRecord(
+                    threadId: threadId,
+                    turnId: turnId,
+                    path: url.path,
+                    sourceType: sourceType,
+                    startedAt: startedAt,
+                    completedAt: completedAt,
+                    completionReason: "completed"
+                ))
+            } else if type == "event_msg",
+                      let threadId,
+                      let turnId = abortedTurnId(from: payload, fallback: nil),
+                      let startedAt = startedAtByTurnId[turnId],
+                      let completedAt = timestamp {
+                completed.append(CompletedTurnRecord(
+                    threadId: threadId,
+                    turnId: turnId,
+                    path: url.path,
+                    sourceType: sourceType,
+                    startedAt: startedAt,
+                    completedAt: completedAt,
+                    completionReason: "stopped"
+                ))
+            }
+        }
+
+        return completed
+    }
+
+    private func processJSONLines(from handle: FileHandle, _ visit: ([String: Any]) -> Void) {
+        let newline = Data([0x0A])
+        var buffer = Data()
+
+        while true {
+            guard let chunk = try? handle.read(upToCount: 256 * 1024), !chunk.isEmpty else { break }
+            buffer.append(chunk)
+
+            while let range = buffer.firstRange(of: newline) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
+                buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+                guard !lineData.isEmpty,
+                      let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+                visit(obj)
+            }
+        }
+
+        guard !buffer.isEmpty,
+              let obj = try? JSONSerialization.jsonObject(with: buffer) as? [String: Any] else { return }
+        visit(obj)
+    }
+
+    private func upsertUsageRecord(_ record: CompletedTurnRecord, in store: inout UsageStore, now: Date) -> Bool {
+        let duration = max(0, Int(record.completedAt.timeIntervalSince(record.startedAt)))
+        let key = "\(record.threadId)#\(record.turnId)"
+        let session = UsageSession(
+            dedupeKey: key,
+            threadId: record.threadId,
+            turnId: record.turnId,
+            sourceType: record.sourceType,
+            startedAt: record.startedAt,
+            completedAt: record.completedAt,
+            durationSeconds: duration,
+            completionReason: record.completionReason,
+            observedFirstAt: now,
+            observedLastAt: now,
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        )
+
+        if let existingIndex = store.sessions.firstIndex(where: { $0.dedupeKey == key }) {
+            let existing = store.sessions[existingIndex]
+            let correctedSession = UsageSession(
+                dedupeKey: session.dedupeKey,
+                threadId: session.threadId,
+                turnId: session.turnId,
+                sourceType: existing.sourceType,
+                startedAt: session.startedAt,
+                completedAt: session.completedAt,
+                durationSeconds: session.durationSeconds,
+                completionReason: session.completionReason,
+                observedFirstAt: session.observedFirstAt,
+                observedLastAt: session.observedLastAt,
+                appVersion: session.appVersion
+            )
+            guard shouldReplaceUsageSession(existing, with: correctedSession) else { return false }
+            store.sessions[existingIndex] = UsageSession(
+                dedupeKey: existing.dedupeKey,
+                threadId: correctedSession.threadId,
+                turnId: correctedSession.turnId,
+                sourceType: correctedSession.sourceType,
+                startedAt: correctedSession.startedAt,
+                completedAt: correctedSession.completedAt,
+                durationSeconds: correctedSession.durationSeconds,
+                completionReason: correctedSession.completionReason,
+                observedFirstAt: existing.observedFirstAt,
+                observedLastAt: now,
+                appVersion: correctedSession.appVersion
+            )
+            return true
+        }
+
+        store.sessions.append(session)
+        return true
     }
 
     private func usageDedupeKey(for rollout: RolloutSession, startedAt: Date, completedAt: Date, duration: Int) -> String {
@@ -1160,6 +1608,13 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
                 totalDurationSeconds: session.durationSeconds,
                 maxDurationSeconds: session.durationSeconds
             ))
+        }
+    }
+
+    private func rebuildDailyRollups(in store: inout UsageStore) {
+        store.dailyRollups = []
+        for session in store.sessions {
+            upsertDailyRollup(for: session, in: &store)
         }
     }
 
@@ -1383,16 +1838,25 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         let icon = currentStatusIcon()
         let segments = showTimerStrip ? statusBarSegments() : []
         let segmentsKey = statusBarSegmentsKey(segments)
+        let badge = showsUpdateBadge()
+        let renderKey = "\(segmentsKey)|update:\(badge ? "1" : "0")"
 
-        if segmentsKey != lastRenderedSegmentsKey {
-            statusBarView.configure(icon: icon, segments: segments, font: textFont)
+        if renderKey != lastRenderedSegmentsKey {
+            statusBarView.configure(icon: icon, segments: segments, font: textFont, showsUpdateBadge: badge)
             let width = ceil(statusBarView.intrinsicContentSize.width)
             statusItem.length = max(26, width)
             statusBarView.frame = NSRect(x: 0, y: 0, width: statusItem.length, height: 22)
-            lastRenderedSegmentsKey = segmentsKey
+            lastRenderedSegmentsKey = renderKey
         } else {
-            statusBarView.updateIcon(icon)
+            statusBarView.updateIcon(icon, showsUpdateBadge: badge)
         }
+    }
+
+    private func showsUpdateBadge() -> Bool {
+        if case .available = updateState {
+            return true
+        }
+        return false
     }
 
     private func shouldAnimateIcon() -> Bool {
@@ -1403,7 +1867,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
     }
 
     private func renderLogo() {
-        statusBarView.updateIcon(currentStatusIcon())
+        statusBarView.updateIcon(currentStatusIcon(), showsUpdateBadge: showsUpdateBadge())
     }
 
     private func currentStatusIcon() -> NSImage? {
@@ -1723,6 +2187,52 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
         return (try? JSONDecoder().decode([ThreadIndexEntry].self, from: data)) ?? []
     }
 
+    private func rolloutPath(forThreadId threadId: String) -> String? {
+        if let cached = rolloutPathByThreadIdCache[threadId] {
+            return cached
+        }
+        guard FileManager.default.fileExists(atPath: stateDatabasePath) else {
+            rolloutPathByThreadIdCache[threadId] = nil
+            return nil
+        }
+
+        let escapedThreadId = threadId.replacingOccurrences(of: "'", with: "''")
+        let query = """
+        select rollout_path
+        from threads
+        where id = '\(escapedThreadId)'
+          and rollout_path is not null
+          and rollout_path <> ''
+        limit 1;
+        """
+
+        let task = Process()
+        let output = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        task.arguments = ["-readonly", stateDatabasePath, query]
+        task.standardOutput = output
+        task.standardError = Pipe()
+
+        do {
+            try task.run()
+        } catch {
+            rolloutPathByThreadIdCache[threadId] = nil
+            return nil
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0,
+              let rawPath = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawPath.isEmpty,
+              FileManager.default.fileExists(atPath: rawPath) else {
+            rolloutPathByThreadIdCache[threadId] = nil
+            return nil
+        }
+        rolloutPathByThreadIdCache[threadId] = rawPath
+        return rawPath
+    }
+
     private func readRolloutSession(from entry: ThreadIndexEntry, titleIndex: [String: String]) -> RolloutSession? {
         guard FileManager.default.fileExists(atPath: entry.rolloutPath) else { return nil }
         let url = URL(fileURLWithPath: entry.rolloutPath)
@@ -1947,9 +2457,7 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             || abortedTurnIds.contains(turnId)
         if isComplete {
             var startedAt = lastCompletedStartedAt ?? firstSeenByTurnId[turnId]
-            if startedAt == nil,
-               sawCompaction,
-               let fullStart = readTaskStartedAt(in: url, turnId: turnId) {
+            if let fullStart = readTaskStartedAt(in: url, turnId: turnId) {
                 startedAt = min(startedAt ?? fullStart, fullStart)
             }
             return (turnId, startedAt, lastCompletedAt, completionReasonByTurnId[turnId] ?? "unknown", false, true)
@@ -2050,12 +2558,33 @@ final class CodexStatusController: NSObject, NSMenuDelegate {
             return true
         }
 
+        if pgrepMatches(pattern: "/Applications/Codex.app|codex app-server|cua_node/bin/node") {
+            return true
+        }
+
         return processRows().contains { row in
             let line = row.raw
             return line.contains("/Applications/Codex.app/")
                 || line.contains("Codex.app/Contents/MacOS/Codex")
                 || line.contains("codex app-server")
         }
+    }
+
+    private func pgrepMatches(pattern: String) -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        task.arguments = ["-fl", pattern]
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
+
+        do {
+            try task.run()
+        } catch {
+            return false
+        }
+
+        task.waitUntilExit()
+        return task.terminationStatus == 0
     }
 
     private func cachedIsCodexRunning(now: Date) -> Bool {

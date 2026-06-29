@@ -32,6 +32,10 @@ turn logs, then presents a compact status view:
   count, and shimmer cadence.
 - **Local activity stats** for completed turns, active time, average duration,
   and longest turn.
+- **Bounded recent stats backfill** that scans recently modified rollout logs
+  to correct missed or undercounted completed turns.
+- **Update indicator groundwork** with a GitHub commit check, blue menu bar
+  badge, and Sparkle-ready update handoff for signed releases.
 - **File watching plus polling** for responsive updates when Codex state files
   change.
 - **Optional local diagnostics** written to
@@ -128,6 +132,11 @@ keeps compact daily rollups indefinitely so the `All` filter remains cheap. It
 does not store prompts, responses, file paths, or conversation titles in the
 activity store.
 
+On launch, Codex Status also performs a capped 24-hour backfill over recently
+modified rollout JSONL files. The backfill streams each file line by line,
+extracts only turn start/completion metadata, and is capped by file count and
+total bytes so it does not scan the full `~/.codex/sessions` history.
+
 ## Menu and Settings
 
 Click the Codex Status icon to open the app menu:
@@ -187,6 +196,17 @@ Disable ad-hoc signing during development with:
 ```bash
 CODESIGN=0 ./build.sh
 ```
+
+Sparkle is optional in local builds. To compile and embed a downloaded
+`Sparkle.framework`, pass:
+
+```bash
+SPARKLE_FRAMEWORK="/path/to/Sparkle.framework" ./build.sh
+```
+
+The menu bar can show an update badge from the public GitHub commit check. The
+Sparkle install handoff requires a signed appcast release feed before it can
+replace and relaunch the app automatically.
 
 ## Troubleshooting
 
